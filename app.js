@@ -12,6 +12,16 @@
 
 'use strict';
 
+// ┌─────────────────────────────────────────────────────────┐
+// │  KONFIGURATION                                            │
+// └─────────────────────────────────────────────────────────┘
+const STUN_SERVERS = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' }
+  ]
+};
+
 // ══════════════════════════════════════════════════════════
 // 1. KRYPTOGRAFI — WebCrypto API (ECDSA P-256)
 // ══════════════════════════════════════════════════════════
@@ -326,111 +336,13 @@ const Peers = {
     });
   },
 
-  /** Skapa inbjudningslänk med publik nyckel + signaleringsserver-URL */
-  createInviteLink() {
+  /** Skapa identitetskod (pubkey+namn) att visa som QR/text för lokal återkänning */
+  identityInfo() {
     if (!Identity.current) return '';
-    const data = btoa(JSON.stringify({
-      pubkey: Identity.current.pubkey,
-      name: Identity.current.name,
-      signalingUrl: Signaling.serverUrl || localStorage.getItem('mycel-signal-url') || 'ws://localhost:8080',
-      ts: Date.now()
+    return btoa(JSON.stringify({
+      pk: Identity.current.pubkey,
+      n: Identity.current.name
     }));
-    const base = location.href.replace(/\?.*$/, '');
-    return `${base}?peer=${data}`;
-  },
-
-  /** Parsa inbjudningslänk */
-  parseInviteLink(url) {
-    try {
-      const u = new URL(url);
-      const p = u.searchParams.get('peer');
-      if (!p) return null;
-      return JSON.parse(atob(p));
-    } catch { return null; }
-  },
-
-  /** Skapa WebRTC RTCPeerConnection och koppla upp datakanaallyssnare */
-  async createPeerConnection(peerPubkey, isInitiator) {
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
-      ]
-    });
-
-    const setupChannel = (channel) => {
-      channel.onopen = () => {
-        const entry = Peers.connections.get(peerPubkey) || {};
-        entry.channel = channel;
-        Peers.connections.set(peerPubkey, entry);
-        UI.updateConnectionStatus(true);
-        UI.renderPeers();
-        UI.updateStats();
-        UI.toast(`✓ P2P-länk öppen med ${entry.name || peerPubkey.slice(0, 8)}`, 'success');
-        setTimeout(() => Gossip.syncWithPeer(peerPubkey), 300);
-      };
-      channel.onclose = () => {
-        const entry = Peers.connections.get(peerPubkey);
-        if (entry) entry.channel = null;
-        UI.renderPeers();
-        UI.updateConnectionStatus(Peers.onlineCount() > 0);
-      };
-      channel.onmessage = async (e) => {
-        let msg;
-        try { msg = JSON.parse(e.data); } catch { return; }
-        await Gossip.handleMessage(msg, peerPubkey);
-      };
-    };
-
-    if (isInitiator) {
-      setupChannel(pc.createDataChannel('mycel', { ordered: false }));
-    } else {
-      pc.ondatachannel = (e) => setupChannel(e.channel);
-    }
-
-    pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        Signaling.send(peerPubkey, { sigType: 'ice-candidate', candidate: e.candidate.toJSON() });
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-        const entry = Peers.connections.get(peerPubkey);
-        if (entry) { entry.channel = null; UI.renderPeers(); }
-      }
-    };
-
-    return pc;
-  },
-
-  /** Upprätta WebRTC-anslutning till en peer via signaleringsservern */
-  async connectToPeer(peerData) {
-    const { pubkey, name } = peerData;
-    if (pubkey === Identity.current?.pubkey) {
-      UI.toast('Det är din egen nyckel!', 'error'); return;
-    }
-    const existing = Peers.connections.get(pubkey);
-    if (existing?.channel?.readyState === 'open') {
-      UI.toast(`Redan ansluten till ${name}`, 'info'); return;
-    }
-    if (!Signaling.isConnected()) {
-      UI.toast('Inte ansluten till signaleringsservern', 'error'); return;
-    }
-
-    Peers.connections.set(pubkey, { name, lastSeen: Date.now(), _pendingCandidates: [] });
-    const pc = await Peers.createPeerConnection(pubkey, true);
-    Peers.connections.get(pubkey).pc = pc;
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    Signaling.send(pubkey, { sigType: 'offer', sdp: pc.localDescription, name: Identity.current.name });
-
-    await Peers.add({ pubkey, name });
-    Network.addNode(pubkey, name);
-    UI.renderPeers();
-    UI.toast(`🔗 Ansluter till ${name}…`, 'info');
-    return true;
   },
 
   onlineCount() {
@@ -443,63 +355,180 @@ const Peers = {
 };
 
 // ══════════════════════════════════════════════════════════
-// 6. SIGNALERING — WebSocket (förmedlar WebRTC offer/answer)
+// 6. MANUELL SIGNALERING — serverlös WebRTC
 // ══════════════════════════════════════════════════════════
-const Signaling = {
-  ws: null,
-  serverUrl: null,
-  _reconnectTimer: null,
+// Flöde:
+//   Steg 1 (A): createOffer()  → kopierar kod → skickar till B via SMS/etc.
+//   Steg 2 (B): acceptOffer() → kopierar kod → skickar tillbaka till A
+//   Steg 3 (A): acceptAnswer() → anslutning öppnas
+// Ingen server krävs. Signaleringen sker via valfri kanal.
+const ManualSignaling = {
+  _pending: new Map(), // tempId → { pc, peerRef }
 
-  async connect(url) {
-    clearTimeout(Signaling._reconnectTimer);
-    Signaling.serverUrl = url;
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const ws = new WebSocket(url);
+  /** Skapar en WebRTC RTCPeerConnection och kopplar datalyssnare */
+  _makePC(isInitiator, connKey, peerRef) {
+    const pc = new RTCPeerConnection(STUN_SERVERS);
 
-      const timeout = setTimeout(() => {
-        if (!settled) { settled = true; ws.close(); reject(new Error('Timeout')); }
-      }, 8000);
-
-      ws.onopen = () => {
-        clearTimeout(timeout);
-        settled = true;
-        Signaling.ws = ws;
-        ws.send(JSON.stringify({ type: 'register', pubkey: Identity.current.pubkey }));
-        resolve();
+    const setupChannel = (ch) => {
+      ch.onopen = () => {
+        const pubkey = peerRef.pubkey;
+        const entry = Peers.connections.get(connKey) || {};
+        entry.channel = ch;
+        entry.name = peerRef.name;
+        entry.lastSeen = Date.now();
+        Peers.connections.set(pubkey, entry);
+        if (connKey !== pubkey) Peers.connections.delete(connKey);
+        UI.updateConnectionStatus(true);
+        UI.renderPeers();
+        UI.updateStats();
+        UI.toast(`✓ Direkt P2P-koppling öppen med ${peerRef.name || pubkey.slice(0, 8)}`, 'success');
+        setTimeout(() => Gossip.syncWithPeer(pubkey), 300);
       };
-
-      ws.onmessage = (e) => {
-        let msg;
-        try { msg = JSON.parse(e.data); } catch { return; }
-        if (msg.type === 'registered') return;
-        Gossip.handleSignalingMessage(msg).catch(console.warn);
-      };
-
-      ws.onclose = () => {
-        Signaling.ws = null;
+      ch.onclose = () => {
+        const entry = Peers.connections.get(peerRef.pubkey);
+        if (entry) entry.channel = null;
+        UI.renderPeers();
         UI.updateConnectionStatus(Peers.onlineCount() > 0);
-        // Återanslut automatiskt efter 5 s
-        Signaling._reconnectTimer = setTimeout(() => {
-          if (Signaling.serverUrl) Signaling.connect(Signaling.serverUrl).catch(() => { });
-        }, 5000);
       };
+      ch.onmessage = async (e) => {
+        let msg; try { msg = JSON.parse(e.data); } catch { return; }
+        await Gossip.handleMessage(msg, peerRef.pubkey);
+      };
+    };
 
-      ws.onerror = () => {
-        clearTimeout(timeout);
-        if (!settled) { settled = true; reject(new Error('WebSocket-fel: ' + url)); }
+    if (isInitiator) {
+      setupChannel(pc.createDataChannel('mycel', { ordered: false }));
+    } else {
+      pc.ondatachannel = (e) => setupChannel(e.channel);
+    }
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        const entry = Peers.connections.get(peerRef.pubkey);
+        if (entry) { entry.channel = null; UI.renderPeers(); }
+      }
+    };
+
+    return pc;
+  },
+
+  /** Väntar tills ICE-insamling är klar (alla noder funna), max 6 s */
+  _waitForIce(pc) {
+    return new Promise(resolve => {
+      if (pc.iceGatheringState === 'complete') { resolve(); return; }
+      const handler = () => {
+        if (pc.iceGatheringState === 'complete') {
+          pc.removeEventListener('icegatheringstatechange', handler);
+          resolve();
+        }
       };
+      pc.addEventListener('icegatheringstatechange', handler);
+      setTimeout(resolve, 6000);
     });
   },
 
-  /** Skicka signaleringsmeddelande till en specifik peer */
-  send(toPubkey, payload) {
-    if (!Signaling.ws || Signaling.ws.readyState !== WebSocket.OPEN) return;
-    Signaling.ws.send(JSON.stringify({ type: 'signal', to: toPubkey, ...payload }));
+  /**
+   * Steg 1 — du skapar en inbjudningskod att skicka till din vän.
+   * Returnerar { code, tempId }
+   */
+  async createOffer() {
+    const tempId = 'p_' + Date.now();
+    const peerRef = { pubkey: null, name: null };
+    Peers.connections.set(tempId, { name: '…', _pendingOffer: true });
+
+    const pc = ManualSignaling._makePC(true, tempId, peerRef);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await ManualSignaling._waitForIce(pc);
+
+    ManualSignaling._pending.set(tempId, { pc, peerRef });
+
+    return {
+      code: btoa(JSON.stringify({
+        v: 1, t: 'o',
+        sdp: pc.localDescription.sdp,
+        pk: Identity.current.pubkey,
+        n: Identity.current.name,
+        id: tempId
+      })),
+      tempId
+    };
   },
 
-  isConnected() {
-    return !!(Signaling.ws && Signaling.ws.readyState === WebSocket.OPEN);
+  /**
+   * Steg 2 — din vän klistrar in din kod, får en svarskod att skicka tillbaka.
+   * Returnerar svarskoden.
+   */
+  async acceptOffer(encoded) {
+    let data;
+    try { data = JSON.parse(atob(encoded.trim())); } catch { throw new Error('Ogiltig inbjudningskod'); }
+    if (data.t !== 'o') throw new Error('Det här är ett svar, inte en inbjudan');
+    if (data.pk === Identity.current?.pubkey) throw new Error('Det är din egen nyckel!');
+
+    const peerPubkey = data.pk;
+    const name = data.n;
+    const peerRef = { pubkey: peerPubkey, name };
+    Peers.connections.set(peerPubkey, { name, _pendingOffer: true });
+
+    const pc = ManualSignaling._makePC(false, peerPubkey, peerRef);
+    await pc.setRemoteDescription({ type: 'offer', sdp: data.sdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await ManualSignaling._waitForIce(pc);
+
+    await Peers.add({ pubkey: peerPubkey, name });
+    Network.addNode(peerPubkey, name);
+    UI.renderPeers();
+
+    return btoa(JSON.stringify({
+      v: 1, t: 'a',
+      sdp: pc.localDescription.sdp,
+      pk: Identity.current.pubkey,
+      n: Identity.current.name,
+      id: data.id
+    }));
+  },
+
+  /**
+   * Steg 3 — du klistrar in svarskoden från din vän, anslutningen öppnas.
+   */
+  async acceptAnswer(encoded) {
+    let data;
+    try { data = JSON.parse(atob(encoded.trim())); } catch { throw new Error('Ogiltig svarskod'); }
+    if (data.t !== 'a') throw new Error('Det här är en inbjudan, inte ett svar');
+
+    const pending = ManualSignaling._pending.get(data.id);
+    if (!pending) throw new Error('Ingen matchande inbjudan. Skapa en ny.');
+    ManualSignaling._pending.delete(data.id);
+
+    pending.peerRef.pubkey = data.pk;
+    pending.peerRef.name = data.n;
+
+    const entry = Peers.connections.get(data.id);
+    if (entry) {
+      Peers.connections.delete(data.id);
+      Peers.connections.set(data.pk, entry);
+    }
+
+    await pending.pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
+    await Peers.add({ pubkey: data.pk, name: data.n });
+    Network.addNode(data.pk, data.n);
+    UI.renderPeers();
+  },
+
+  /** Autodetektera om inklistrad kod är inbjudan eller svar, kör rätt funktion */
+  async handlePastedCode(encoded) {
+    let data;
+    try { data = JSON.parse(atob(encoded.trim())); } catch { throw new Error('Ogiltig kod'); }
+    if (data.t === 'o') {
+      const answerCode = await ManualSignaling.acceptOffer(encoded);
+      return { action: 'answered', code: answerCode };
+    }
+    if (data.t === 'a') {
+      await ManualSignaling.acceptAnswer(encoded);
+      return { action: 'connected' };
+    }
+    throw new Error('Okänd kodtyp');
   }
 };
 
@@ -510,77 +539,7 @@ const Gossip = {
   active: true,
 
   init() {
-    if (!Identity.current) return;
-    const url = localStorage.getItem('mycel-signal-url') || 'ws://localhost:8080';
-    const el = document.getElementById('signal-server-url');
-    if (el) el.value = url;
-    Signaling.connect(url).then(() => {
-      UI.updateConnectionStatus(true);
-    }).catch(() => {
-      UI.toast('⚠ Signaleringsserver ej nåbar — kör: node server.js', 'error');
-    });
-  },
-
-  /** Hanterar WebRTC-signalering som kommer via WebSocket-servern */
-  async handleSignalingMessage(msg) {
-    const fromPubkey = msg.from;
-    if (!fromPubkey || fromPubkey === Identity.current?.pubkey) return;
-
-    switch (msg.sigType) {
-      case 'offer': {
-        const entry = Peers.connections.get(fromPubkey) || { _pendingCandidates: [] };
-        entry.name = msg.name || entry.name || 'Okänd';
-        entry._pendingCandidates = entry._pendingCandidates || [];
-        Peers.connections.set(fromPubkey, entry);
-
-        const pc = await Peers.createPeerConnection(fromPubkey, false);
-        entry.pc = pc;
-
-        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-        for (const c of entry._pendingCandidates) {
-          try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch { }
-        }
-        entry._pendingCandidates = [];
-
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        Signaling.send(fromPubkey, { sigType: 'answer', sdp: pc.localDescription });
-
-        await Peers.add({ pubkey: fromPubkey, name: entry.name });
-        Network.addNode(fromPubkey, entry.name);
-        break;
-      }
-
-      case 'answer': {
-        const entry = Peers.connections.get(fromPubkey);
-        if (!entry?.pc) return;
-        try {
-          await entry.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-          for (const c of (entry._pendingCandidates || [])) {
-            try { await entry.pc.addIceCandidate(new RTCIceCandidate(c)); } catch { }
-          }
-          entry._pendingCandidates = [];
-        } catch (err) {
-          console.warn('[WebRTC] answer-fel:', err);
-        }
-        break;
-      }
-
-      case 'ice-candidate': {
-        const entry = Peers.connections.get(fromPubkey);
-        if (!entry) {
-          Peers.connections.set(fromPubkey, { _pendingCandidates: [msg.candidate] });
-          return;
-        }
-        if (entry.pc?.remoteDescription) {
-          try { await entry.pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); } catch { }
-        } else {
-          entry._pendingCandidates = (entry._pendingCandidates || []);
-          entry._pendingCandidates.push(msg.candidate);
-        }
-        break;
-      }
-    }
+    // Inget att initiera — anslutningar görs manuellt via ManualSignaling
   },
 
   async handleMessage(msg, fromPubkey) {
@@ -1010,11 +969,11 @@ const UI = {
 
   renderQR() {
     const canvas = document.getElementById('qr-canvas');
-    const inviteText = document.getElementById('invite-link-text');
+    const identityText = document.getElementById('identity-info-text');
     if (!canvas || !Identity.current) return;
-    const link = Peers.createInviteLink();
-    QR.drawInviteCode(canvas, link);
-    if (inviteText) inviteText.textContent = link;
+    const info = `${Identity.current.name} · ${Identity.shortKey(Identity.current.pubkey)}`;
+    QR.drawInviteCode(canvas, info);
+    if (identityText) identityText.textContent = Identity.current.pubkey;
   },
 
   renderIdentity() {
@@ -1128,27 +1087,10 @@ async function init() {
     Network.init();
     SW.register();
 
-    // Kontrollera URL för peer-inbjudan
+    // Rensa peer-param ur URL om den finns kvar från en gammal session
     const url = new URL(location.href);
-    const peerParam = url.searchParams.get('peer');
-    if (peerParam) {
-      try {
-        const peerData = JSON.parse(atob(peerParam));
-        // Om inbjudan innehåller signaleringsserver — spara och anslut
-        if (peerData.signalingUrl) {
-          localStorage.setItem('mycel-signal-url', peerData.signalingUrl);
-          if (peerData.signalingUrl !== Signaling.serverUrl) {
-            Signaling.connect(peerData.signalingUrl).catch(() => { });
-          }
-        }
-        setTimeout(() => {
-          if (confirm(`Anslut till ${peerData.name}?`)) {
-            Peers.connectToPeer(peerData);
-          }
-        }, 1500); // ge WebSocket-anslutning tid att öppnas
-        // Rensa URL
-        history.replaceState({}, '', location.pathname);
-      } catch { }
+    if (url.searchParams.has('peer')) {
+      history.replaceState({}, '', location.pathname);
     }
 
     // Periodisk status-uppdatering
@@ -1233,28 +1175,62 @@ async function init() {
   });
 
   // Peers
-  document.getElementById('btn-connect-peer')?.addEventListener('click', async () => {
-    const val = document.getElementById('peer-invite-input').value.trim();
-    if (!val) return;
-    const data = Peers.parseInviteLink(val);
-    if (!data) { UI.toast('Ogiltig inbjudningslänk', 'error'); return; }
-    await Peers.connectToPeer(data);
-    document.getElementById('peer-invite-input').value = '';
-  });
-
-  document.getElementById('btn-copy-invite')?.addEventListener('click', () => {
-    const link = Peers.createInviteLink();
-    navigator.clipboard?.writeText(link).then(() => UI.toast('📋 Länk kopierad!', 'success'));
-  });
-
-  document.getElementById('btn-share-invite')?.addEventListener('click', () => {
-    const link = Peers.createInviteLink();
-    if (navigator.share) {
-      navigator.share({ title: 'Gå med i Mycel', url: link });
-    } else {
-      navigator.clipboard?.writeText(link);
-      UI.toast('📋 Länk kopierad!', 'success');
+  // Peers — Skapa inbjudan
+  document.getElementById('btn-create-offer')?.addEventListener('click', async () => {
+    const btn = document.getElementById('btn-create-offer');
+    btn.disabled = true;
+    try {
+      UI.toast('⏳ Samlar nätverksvägar…', 'info');
+      const { code } = await ManualSignaling.createOffer();
+      const box = document.getElementById('offer-output-box');
+      const pre = document.getElementById('offer-output-code');
+      if (pre) pre.textContent = code;
+      if (box) box.style.display = 'block';
+      UI.toast('✔ Inbjudningskod skapad — kopiera och skicka!', 'success');
+    } catch (err) {
+      UI.toast('Fel: ' + err.message, 'error');
+    } finally {
+      btn.disabled = false;
     }
+  });
+
+  document.getElementById('btn-copy-offer')?.addEventListener('click', () => {
+    const code = document.getElementById('offer-output-code')?.textContent;
+    if (code) navigator.clipboard?.writeText(code).then(() => UI.toast('📋 Kopierat!', 'success'));
+  });
+
+  // Peers — Klistra in kod (inbjudan eller svar)
+  document.getElementById('btn-handle-code')?.addEventListener('click', async () => {
+    const input = document.getElementById('peer-code-input');
+    const code = input?.value.trim();
+    if (!code) return;
+    const btn = document.getElementById('btn-handle-code');
+    btn.disabled = true;
+    try {
+      const result = await ManualSignaling.handlePastedCode(code);
+      if (result.action === 'answered') {
+        const box = document.getElementById('answer-output-box');
+        const pre = document.getElementById('answer-output-code');
+        if (pre) pre.textContent = result.code;
+        if (box) box.style.display = 'block';
+        input.value = '';
+        UI.toast('✔ Svarskod skapad — skicka tillbaka till din vän!', 'success');
+      } else if (result.action === 'connected') {
+        input.value = '';
+        document.getElementById('answer-output-box').style.display = 'none';
+        document.getElementById('offer-output-box').style.display = 'none';
+        UI.toast('⏳ Upprättar direkt P2P-koppling…', 'info');
+      }
+    } catch (err) {
+      UI.toast('⚠ ' + err.message, 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  document.getElementById('btn-copy-answer')?.addEventListener('click', () => {
+    const code = document.getElementById('answer-output-code')?.textContent;
+    if (code) navigator.clipboard?.writeText(code).then(() => UI.toast('📋 Kopierat!', 'success'));
   });
 
   // Identity
@@ -1317,19 +1293,6 @@ async function init() {
     Gossip.active = !Gossip.active;
     e.target.textContent = Gossip.active ? 'Aktivt ✓' : 'Inaktivt';
     UI.toast(Gossip.active ? '📡 Gossip-protokoll aktiverat' : '🔇 Gossip pausat', 'info');
-  });
-
-  // Signaleringsserver URL — spara och anslut vid ändring
-  document.getElementById('signal-server-url')?.addEventListener('change', async (e) => {
-    const serverUrl = e.target.value.trim();
-    if (!serverUrl) return;
-    localStorage.setItem('mycel-signal-url', serverUrl);
-    try {
-      await Signaling.connect(serverUrl);
-      UI.toast('✓ Ansluten till signaleringsservern', 'success');
-    } catch (err) {
-      UI.toast('⚠ Kunde inte ansluta: ' + err.message, 'error');
-    }
   });
 }
 
