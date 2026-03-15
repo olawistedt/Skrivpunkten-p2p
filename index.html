@@ -673,35 +673,50 @@
 
   <!-- ═══ PEERS ═══ -->
   <div id="screen-peers" class="screen">
+
+    <!-- Steg 1: Skapa inbjudan -->
     <div class="card highlight">
-      <div class="section-title">Min QR-inbjudan</div>
-      <p class="text-muted" style="font-size:11px;margin-bottom:8px;">
-        ⚠️ Inbjudningslänken innehåller din signaleringsserver-URL. Se till att servern körs
-        och är nåbar för din vän innan du delar länken.
+      <div class="section-title">📤 Steg 1 — Skapa inbjudningskod</div>
+      <p class="text-muted" style="font-size:12px;margin-bottom:12px;">
+        Klicka nedan, kopiera koden och skicka den till din vän via SMS, Signal, e-post — vad som helst.
       </p>
-      <div class="text-center mt-8">
-        <canvas id="qr-canvas" class="qr-box" width="180" height="180"></canvas>
-      </div>
-      <p class="text-muted text-center mt-8" style="font-size:11px;">
-        Låt en vän skanna för att ansluta direkt
-      </p>
-      <div class="invite-link-box mt-8" id="invite-link-text">—</div>
-      <div class="flex gap-8 mt-12">
-        <button class="btn btn-ghost btn-sm w-full" id="btn-copy-invite">📋 Kopiera länk</button>
-        <button class="btn btn-primary btn-sm w-full" id="btn-share-invite">↑ Dela</button>
+      <button class="btn btn-primary w-full" id="btn-create-offer">🔗 Skapa inbjudningskod</button>
+      <div id="offer-output-box" style="display:none;margin-top:14px;">
+        <div class="form-label">✔ Din inbjudningskod (skicka till din vän):</div>
+        <div class="invite-link-box mt-8" id="offer-output-code" style="font-size:10px;max-height:80px;overflow:auto;word-break:break-all;"></div>
+        <button class="btn btn-primary btn-sm w-full mt-8" id="btn-copy-offer">📋 Kopiera inbjudningskod</button>
       </div>
     </div>
 
+    <!-- Steg 2/3: Klistra in kod -->
     <div class="card mt-12">
-      <div class="section-title">Anslut via länk</div>
-      <input type="text" id="peer-invite-input" placeholder="Klistra in inbjudningslänk..." />
-      <button class="btn btn-primary btn-sm mt-8 w-full" id="btn-connect-peer">🤝 Anslut</button>
+      <div class="section-title">📥 Steg 2 eller 3 — Klistra in kod</div>
+      <p class="text-muted" style="font-size:12px;margin-bottom:10px;">
+        Fått en inbjudningskod av någon? Klistra in den här.<br>
+        Fått tillbaka ett svar på din egna kod? Klistra in det här.
+      </p>
+      <textarea id="peer-code-input" placeholder="Klistra in kod här…" style="min-height:60px;font-size:11px;"></textarea>
+      <button class="btn btn-primary btn-sm w-full mt-8" id="btn-handle-code">→ Hantera kod</button>
+      <div id="answer-output-box" style="display:none;margin-top:14px;">
+        <div class="form-label">✔ Din svarskod (skicka tillbaka till din vän):</div>
+        <div class="invite-link-box mt-8" id="answer-output-code" style="font-size:10px;max-height:80px;overflow:auto;word-break:break-all;"></div>
+        <button class="btn btn-primary btn-sm w-full mt-8" id="btn-copy-answer">📋 Kopiera svarskod</button>
+      </div>
+    </div>
+
+    <!-- Identitet -->
+    <div class="card mt-12">
+      <div class="section-title">Din publika nyckel</div>
+      <div class="text-center">
+        <canvas id="qr-canvas" class="qr-box" width="140" height="140"></canvas>
+      </div>
+      <div class="identity-pubkey mt-8" id="identity-info-text" style="font-size:9px;"></div>
     </div>
 
     <div class="section-title mt-16">Mina peers</div>
     <div id="peers-list">
       <div class="card text-muted text-center" style="font-size:12px;">
-        Inga peers ännu — dela din QR-kod för att komma igång.
+        Inga peers ännu.
       </div>
     </div>
 
