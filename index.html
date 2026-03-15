@@ -706,11 +706,12 @@
 
     <!-- Identitet -->
     <div class="card mt-12">
-      <div class="section-title">Din publika nyckel</div>
-      <div class="text-center">
-        <canvas id="qr-canvas" class="qr-box" width="140" height="140"></canvas>
-      </div>
-      <div class="identity-pubkey mt-8" id="identity-info-text" style="font-size:9px;"></div>
+      <div class="section-title">Din publik nyckel</div>
+      <p class="text-muted" style="font-size:11px;margin-bottom:8px;">
+        Enbart för identifikation — <strong>inte</strong> en anslutningskod.
+        För att ansluta: använd “Skapa inbjudningskod” ovan.
+      </p>
+      <div class="identity-pubkey" id="identity-info-text" style="font-size:9px;"></div>
     </div>
 
     <div class="section-title mt-16">Mina peers</div>

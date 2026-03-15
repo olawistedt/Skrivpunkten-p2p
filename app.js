@@ -307,7 +307,11 @@ const Posts = {
       timestamp: post.timestamp
     });
     const valid = await Crypto.verify(post.authorPubkey, payload, post.signature);
-    if (!valid) { console.warn('Ogiltig signatur på inlägg:', post.id); return false; }
+    if (!valid) {
+      console.warn('Ogiltig signatur på inlägg:', post.id);
+      UI.toast('⚠️ Mottog inlägg med ogiltig signatur', 'error');
+      return false;
+    }
 
     post.hops = (post.hops || 0) + 1;
     post.local = false;
@@ -370,7 +374,7 @@ const ManualSignaling = {
     const pc = new RTCPeerConnection(STUN_SERVERS);
 
     const setupChannel = (ch) => {
-      ch.onopen = () => {
+      const onOpen = () => {
         const pubkey = peerRef.pubkey;
         const entry = Peers.connections.get(connKey) || {};
         entry.channel = ch;
@@ -384,6 +388,13 @@ const ManualSignaling = {
         UI.toast(`✓ Direkt P2P-koppling öppen med ${peerRef.name || pubkey.slice(0, 8)}`, 'success');
         setTimeout(() => Gossip.syncWithPeer(pubkey), 300);
       };
+
+      if (ch.readyState === 'open') {
+        onOpen();
+      } else {
+        ch.onopen = onOpen;
+      }
+
       ch.onclose = () => {
         const entry = Peers.connections.get(peerRef.pubkey);
         if (entry) entry.channel = null;
@@ -518,8 +529,13 @@ const ManualSignaling = {
 
   /** Autodetektera om inklistrad kod är inbjudan eller svar, kör rätt funktion */
   async handlePastedCode(encoded) {
+    const clean = encoded.replace(/\s+/g, '');
+    // Utfärda hjälpsamt felmeddelande om användaren klistrat in sin pubkey istället
+    if (/^[0-9a-f]{40,}$/i.test(clean)) {
+      throw new Error('Det här är en publik nyckel, inte en anslutningskod. Anslutningskoden får du genom att din vän klickar \u201cSkapa inbjudningskod\u201d.');
+    }
     let data;
-    try { data = JSON.parse(atob(encoded.replace(/\s+/g, ''))); } catch { throw new Error('Ogiltig kod'); }
+    try { data = JSON.parse(atob(clean)); } catch { throw new Error('Ogiltig kod — se till att kopiera hela koden utan radbrytningar.'); }
     if (data.t === 'o') {
       const answerCode = await ManualSignaling.acceptOffer(encoded);
       return { action: 'answered', code: answerCode };
