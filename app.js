@@ -4,7 +4,7 @@
  * Arkitektur (enligt specifikationen):
  *  1. Asymmetrisk kryptografi (ECDSA P-256) för identitet & signering
  *  2. IndexedDB för offline-first lokal lagring
- *  3. BroadcastChannel + simulerad WebRTC-signaleringskanal för P2P
+ *  3. WebRTC (RTCPeerConnection + RTCDataChannel) för P2P
  *  4. Gossip-protokoll för dataspridning
  *  5. Social Recovery via Shamir-liknande nyckeldelning (simulerad)
  *  6. PWA Service Worker
@@ -95,8 +95,8 @@ const Crypto = {
   /** Generera slumpmässigt UUID */
   uuid() {
     return crypto.randomUUID ? crypto.randomUUID()
-      : ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
-          (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (c / 4)))).toString(16));
+      : ([1e7] + -1e3 + -4e3 + -8e3 + -1e11).replace(/[018]/g, c =>
+        (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (c / 4)))).toString(16));
   }
 };
 
@@ -220,7 +220,7 @@ const Identity = {
   },
 
   avatarEmoji(pubkey) {
-    const emojis = ['🌱','🌿','🍀','🌲','🍄','🌾','🌸','🌺','🌻','🌼','🍁','🦋','🐝','🐞','🦎','🐸','🦊','🐺','🦁','🐬'];
+    const emojis = ['🌱', '🌿', '🍀', '🌲', '🍄', '🌾', '🌸', '🌺', '🌻', '🌼', '🍁', '🦋', '🐝', '🐞', '🦎', '🐸', '🦊', '🐺', '🦁', '🐬'];
     const idx = parseInt((pubkey || '0').slice(-4), 16) % emojis.length;
     return emojis[idx];
   },
@@ -236,13 +236,13 @@ const Identity = {
 
     for (let i = 0; i < n - 1; i++) {
       const rand = crypto.getRandomValues(new Uint8Array(data.length));
-      shards.push(Array.from(rand).map(b => b.toString(16).padStart(2,'0')).join(''));
+      shards.push(Array.from(rand).map(b => b.toString(16).padStart(2, '0')).join(''));
       for (let j = 0; j < data.length; j++) xorAccum[j] ^= rand[j];
     }
     // Sista shard = data XOR alla övriga
     const lastShard = new Uint8Array(data.length);
     for (let j = 0; j < data.length; j++) lastShard[j] = data[j] ^ xorAccum[j];
-    shards.push(Array.from(lastShard).map(b => b.toString(16).padStart(2,'0')).join(''));
+    shards.push(Array.from(lastShard).map(b => b.toString(16).padStart(2, '0')).join(''));
 
     return shards;
   }
@@ -326,15 +326,17 @@ const Peers = {
     });
   },
 
-  /** Skapa inbjudningslänk med publik nyckel */
+  /** Skapa inbjudningslänk med publik nyckel + signaleringsserver-URL */
   createInviteLink() {
     if (!Identity.current) return '';
     const data = btoa(JSON.stringify({
       pubkey: Identity.current.pubkey,
       name: Identity.current.name,
+      signalingUrl: Signaling.serverUrl || localStorage.getItem('mycel-signal-url') || 'ws://localhost:8080',
       ts: Date.now()
     }));
-    return `${location.origin}${location.pathname}?peer=${data}`;
+    const base = location.href.replace(/\?.*$/, '');
+    return `${base}?peer=${data}`;
   },
 
   /** Parsa inbjudningslänk */
@@ -347,81 +349,243 @@ const Peers = {
     } catch { return null; }
   },
 
-  /** Simulera WebRTC-anslutning via BroadcastChannel */
+  /** Skapa WebRTC RTCPeerConnection och koppla upp datakanaallyssnare */
+  async createPeerConnection(peerPubkey, isInitiator) {
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
+    });
+
+    const setupChannel = (channel) => {
+      channel.onopen = () => {
+        const entry = Peers.connections.get(peerPubkey) || {};
+        entry.channel = channel;
+        Peers.connections.set(peerPubkey, entry);
+        UI.updateConnectionStatus(true);
+        UI.renderPeers();
+        UI.updateStats();
+        UI.toast(`✓ P2P-länk öppen med ${entry.name || peerPubkey.slice(0, 8)}`, 'success');
+        setTimeout(() => Gossip.syncWithPeer(peerPubkey), 300);
+      };
+      channel.onclose = () => {
+        const entry = Peers.connections.get(peerPubkey);
+        if (entry) entry.channel = null;
+        UI.renderPeers();
+        UI.updateConnectionStatus(Peers.onlineCount() > 0);
+      };
+      channel.onmessage = async (e) => {
+        let msg;
+        try { msg = JSON.parse(e.data); } catch { return; }
+        await Gossip.handleMessage(msg, peerPubkey);
+      };
+    };
+
+    if (isInitiator) {
+      setupChannel(pc.createDataChannel('mycel', { ordered: false }));
+    } else {
+      pc.ondatachannel = (e) => setupChannel(e.channel);
+    }
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        Signaling.send(peerPubkey, { sigType: 'ice-candidate', candidate: e.candidate.toJSON() });
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        const entry = Peers.connections.get(peerPubkey);
+        if (entry) { entry.channel = null; UI.renderPeers(); }
+      }
+    };
+
+    return pc;
+  },
+
+  /** Upprätta WebRTC-anslutning till en peer via signaleringsservern */
   async connectToPeer(peerData) {
     const { pubkey, name } = peerData;
-    if (Peers.connections.has(pubkey)) return;
     if (pubkey === Identity.current?.pubkey) {
       UI.toast('Det är din egen nyckel!', 'error'); return;
     }
+    const existing = Peers.connections.get(pubkey);
+    if (existing?.channel?.readyState === 'open') {
+      UI.toast(`Redan ansluten till ${name}`, 'info'); return;
+    }
+    if (!Signaling.isConnected()) {
+      UI.toast('Inte ansluten till signaleringsservern', 'error'); return;
+    }
 
-    // I produktion: WebRTC offer/answer exchange
-    // Här simulerar vi med BroadcastChannel
-    const channel = new BroadcastChannel(`mycel-p2p-${pubkey}`);
-    Peers.connections.set(pubkey, { channel, name, lastSeen: Date.now() });
+    Peers.connections.set(pubkey, { name, lastSeen: Date.now(), _pendingCandidates: [] });
+    const pc = await Peers.createPeerConnection(pubkey, true);
+    Peers.connections.get(pubkey).pc = pc;
 
-    channel.onmessage = async (e) => {
-      await Gossip.handleMessage(e.data, pubkey);
-    };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    Signaling.send(pubkey, { sigType: 'offer', sdp: pc.localDescription, name: Identity.current.name });
 
     await Peers.add({ pubkey, name });
-
-    // Skicka handshake
-    channel.postMessage({
-      type: 'handshake',
-      from: Identity.current.pubkey,
-      name: Identity.current.name,
-      ts: Date.now()
-    });
-
-    // Skicka egna inlägg som gossip
-    setTimeout(() => Gossip.syncWithPeer(pubkey), 500);
-    UI.toast(`✓ Ansluten till ${name}`, 'success');
     Network.addNode(pubkey, name);
     UI.renderPeers();
-    UI.updateStats();
+    UI.toast(`🔗 Ansluter till ${name}…`, 'info');
     return true;
   },
 
   onlineCount() {
-    return Peers.connections.size;
+    let count = 0;
+    for (const [, conn] of Peers.connections) {
+      if (conn.channel?.readyState === 'open') count++;
+    }
+    return count;
   }
 };
 
 // ══════════════════════════════════════════════════════════
-// 6. GOSSIP-PROTOKOLL
+// 6. SIGNALERING — WebSocket (förmedlar WebRTC offer/answer)
+// ══════════════════════════════════════════════════════════
+const Signaling = {
+  ws: null,
+  serverUrl: null,
+  _reconnectTimer: null,
+
+  async connect(url) {
+    clearTimeout(Signaling._reconnectTimer);
+    Signaling.serverUrl = url;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const ws = new WebSocket(url);
+
+      const timeout = setTimeout(() => {
+        if (!settled) { settled = true; ws.close(); reject(new Error('Timeout')); }
+      }, 8000);
+
+      ws.onopen = () => {
+        clearTimeout(timeout);
+        settled = true;
+        Signaling.ws = ws;
+        ws.send(JSON.stringify({ type: 'register', pubkey: Identity.current.pubkey }));
+        resolve();
+      };
+
+      ws.onmessage = (e) => {
+        let msg;
+        try { msg = JSON.parse(e.data); } catch { return; }
+        if (msg.type === 'registered') return;
+        Gossip.handleSignalingMessage(msg).catch(console.warn);
+      };
+
+      ws.onclose = () => {
+        Signaling.ws = null;
+        UI.updateConnectionStatus(Peers.onlineCount() > 0);
+        // Återanslut automatiskt efter 5 s
+        Signaling._reconnectTimer = setTimeout(() => {
+          if (Signaling.serverUrl) Signaling.connect(Signaling.serverUrl).catch(() => { });
+        }, 5000);
+      };
+
+      ws.onerror = () => {
+        clearTimeout(timeout);
+        if (!settled) { settled = true; reject(new Error('WebSocket-fel: ' + url)); }
+      };
+    });
+  },
+
+  /** Skicka signaleringsmeddelande till en specifik peer */
+  send(toPubkey, payload) {
+    if (!Signaling.ws || Signaling.ws.readyState !== WebSocket.OPEN) return;
+    Signaling.ws.send(JSON.stringify({ type: 'signal', to: toPubkey, ...payload }));
+  },
+
+  isConnected() {
+    return !!(Signaling.ws && Signaling.ws.readyState === WebSocket.OPEN);
+  }
+};
+
+// ══════════════════════════════════════════════════════════
+// 7. GOSSIP-PROTOKOLL
 // ══════════════════════════════════════════════════════════
 const Gossip = {
   active: true,
-  selfChannel: null, // lyssnar på alla kanaler
 
   init() {
-    // Lyssna på vår egna pubkey-kanal
     if (!Identity.current) return;
-    Gossip.selfChannel = new BroadcastChannel(`mycel-p2p-${Identity.current.pubkey}`);
-    Gossip.selfChannel.onmessage = async (e) => {
-      await Gossip.handleMessage(e.data, e.data.from);
-    };
+    const url = localStorage.getItem('mycel-signal-url') || 'ws://localhost:8080';
+    const el = document.getElementById('signal-server-url');
+    if (el) el.value = url;
+    Signaling.connect(url).then(() => {
+      UI.updateConnectionStatus(true);
+    }).catch(() => {
+      UI.toast('⚠ Signaleringsserver ej nåbar — kör: node server.js', 'error');
+    });
+  },
+
+  /** Hanterar WebRTC-signalering som kommer via WebSocket-servern */
+  async handleSignalingMessage(msg) {
+    const fromPubkey = msg.from;
+    if (!fromPubkey || fromPubkey === Identity.current?.pubkey) return;
+
+    switch (msg.sigType) {
+      case 'offer': {
+        const entry = Peers.connections.get(fromPubkey) || { _pendingCandidates: [] };
+        entry.name = msg.name || entry.name || 'Okänd';
+        entry._pendingCandidates = entry._pendingCandidates || [];
+        Peers.connections.set(fromPubkey, entry);
+
+        const pc = await Peers.createPeerConnection(fromPubkey, false);
+        entry.pc = pc;
+
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        for (const c of entry._pendingCandidates) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch { }
+        }
+        entry._pendingCandidates = [];
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        Signaling.send(fromPubkey, { sigType: 'answer', sdp: pc.localDescription });
+
+        await Peers.add({ pubkey: fromPubkey, name: entry.name });
+        Network.addNode(fromPubkey, entry.name);
+        break;
+      }
+
+      case 'answer': {
+        const entry = Peers.connections.get(fromPubkey);
+        if (!entry?.pc) return;
+        try {
+          await entry.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          for (const c of (entry._pendingCandidates || [])) {
+            try { await entry.pc.addIceCandidate(new RTCIceCandidate(c)); } catch { }
+          }
+          entry._pendingCandidates = [];
+        } catch (err) {
+          console.warn('[WebRTC] answer-fel:', err);
+        }
+        break;
+      }
+
+      case 'ice-candidate': {
+        const entry = Peers.connections.get(fromPubkey);
+        if (!entry) {
+          Peers.connections.set(fromPubkey, { _pendingCandidates: [msg.candidate] });
+          return;
+        }
+        if (entry.pc?.remoteDescription) {
+          try { await entry.pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); } catch { }
+        } else {
+          entry._pendingCandidates = (entry._pendingCandidates || []);
+          entry._pendingCandidates.push(msg.candidate);
+        }
+        break;
+      }
+    }
   },
 
   async handleMessage(msg, fromPubkey) {
     if (!msg || !msg.type) return;
     switch (msg.type) {
-      case 'handshake':
-        if (!Peers.connections.has(fromPubkey)) {
-          const ch = new BroadcastChannel(`mycel-p2p-${fromPubkey}`);
-          Peers.connections.set(fromPubkey, {
-            channel: ch, name: msg.name, lastSeen: Date.now()
-          });
-          await Peers.add({ pubkey: fromPubkey, name: msg.name });
-          Network.addNode(fromPubkey, msg.name);
-          UI.renderPeers();
-          UI.updateStats();
-          UI.toast(`📡 ${msg.name} anslöt sig`, 'info');
-          setTimeout(() => Gossip.syncWithPeer(fromPubkey), 300);
-        }
-        break;
-
       case 'post':
         if (Gossip.active && msg.post) {
           const isNew = await Posts.receiveFromGossip(msg.post);
@@ -434,18 +598,18 @@ const Gossip = {
         }
         break;
 
-      case 'sync_request':
-        // Svara med alla dina inlägg
+      case 'sync_request': {
         const posts = await Posts.getAll();
         const conn = Peers.connections.get(fromPubkey);
-        if (conn) {
-          conn.channel.postMessage({
+        if (conn?.channel?.readyState === 'open') {
+          conn.channel.send(JSON.stringify({
             type: 'sync_response',
             from: Identity.current.pubkey,
             posts
-          });
+          }));
         }
         break;
+      }
 
       case 'sync_response':
         if (msg.posts && Array.isArray(msg.posts)) {
@@ -473,36 +637,40 @@ const Gossip = {
   broadcast(message) {
     if (!Gossip.active) return;
     for (const [pubkey, conn] of Peers.connections) {
-      try {
-        conn.channel.postMessage({
-          ...message,
-          from: Identity.current?.pubkey
-        });
-      } catch (err) {
-        console.warn('Kunde inte skicka till peer:', pubkey, err);
+      if (conn.channel?.readyState === 'open') {
+        try {
+          conn.channel.send(JSON.stringify({
+            ...message,
+            from: Identity.current?.pubkey
+          }));
+        } catch (err) {
+          console.warn('Kunde inte skicka till peer:', pubkey, err);
+        }
       }
     }
   },
 
   async syncWithPeer(pubkey) {
     const conn = Peers.connections.get(pubkey);
-    if (!conn) return;
-    conn.channel.postMessage({
+    if (!conn?.channel || conn.channel.readyState !== 'open') return;
+    conn.channel.send(JSON.stringify({
       type: 'sync_request',
       from: Identity.current.pubkey
-    });
+    }));
   },
 
   forwardToOthers(msg, exceptPubkey) {
     if (msg.post && msg.post.hops >= 6) return; // max 6 hopp
     for (const [pubkey, conn] of Peers.connections) {
       if (pubkey === exceptPubkey) continue;
-      try {
-        conn.channel.postMessage({
-          ...msg,
-          from: Identity.current?.pubkey
-        });
-      } catch {}
+      if (conn.channel?.readyState === 'open') {
+        try {
+          conn.channel.send(JSON.stringify({
+            ...msg,
+            from: Identity.current?.pubkey
+          }));
+        } catch { }
+      }
     }
   }
 };
@@ -536,12 +704,12 @@ const Network = {
     const angle = Math.random() * Math.PI * 2;
     const r = 40 + Math.random() * 60;
     Network.nodes.set(pubkey, {
-      x: W/2 + Math.cos(angle) * (isSelf ? 0 : r),
-      y: H/2 + Math.sin(angle) * (isSelf ? 0 : r),
+      x: W / 2 + Math.cos(angle) * (isSelf ? 0 : r),
+      y: H / 2 + Math.sin(angle) * (isSelf ? 0 : r),
       name, isSelf,
       emoji: Identity.avatarEmoji(pubkey),
-      vx: (Math.random()-0.5)*0.5,
-      vy: (Math.random()-0.5)*0.5
+      vx: (Math.random() - 0.5) * 0.5,
+      vy: (Math.random() - 0.5) * 0.5
     });
 
     if (!isSelf && Identity.current) {
@@ -572,23 +740,23 @@ const Network = {
     for (const [, node] of Network.nodes) {
       node.x += node.vx;
       node.y += node.vy;
-      if (node.x < 20 || node.x > W-20) node.vx *= -1;
-      if (node.y < 20 || node.y > H-20) node.vy *= -1;
+      if (node.x < 20 || node.x > W - 20) node.vx *= -1;
+      if (node.y < 20 || node.y > H - 20) node.vy *= -1;
     }
 
     // Repulsion
     const arr = [...Network.nodes.values()];
     for (let i = 0; i < arr.length; i++) {
-      for (let j = i+1; j < arr.length; j++) {
+      for (let j = i + 1; j < arr.length; j++) {
         const dx = arr[j].x - arr[i].x;
         const dy = arr[j].y - arr[i].y;
-        const dist = Math.sqrt(dx*dx+dy*dy) || 1;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
         if (dist < 80) {
-          const f = (80-dist)/80 * 0.3;
-          arr[i].vx -= dx/dist*f;
-          arr[i].vy -= dy/dist*f;
-          arr[j].vx += dx/dist*f;
-          arr[j].vy += dy/dist*f;
+          const f = (80 - dist) / 80 * 0.3;
+          arr[i].vx -= dx / dist * f;
+          arr[i].vy -= dy / dist * f;
+          arr[j].vx += dx / dist * f;
+          arr[j].vy += dy / dist * f;
         }
       }
     }
@@ -610,7 +778,7 @@ const Network = {
       const px = a.x + (b.x - a.x) * t;
       const py = a.y + (b.y - a.y) * t;
       ctx.beginPath();
-      ctx.arc(px, py, 2.5, 0, Math.PI*2);
+      ctx.arc(px, py, 2.5, 0, Math.PI * 2);
       ctx.fillStyle = 'rgba(124,252,138,0.8)';
       ctx.fill();
     }
@@ -619,7 +787,7 @@ const Network = {
     for (const [pubkey, node] of Network.nodes) {
       const isSelected = pubkey === Identity.current?.pubkey;
       ctx.beginPath();
-      ctx.arc(node.x, node.y, isSelected ? 14 : 10, 0, Math.PI*2);
+      ctx.arc(node.x, node.y, isSelected ? 14 : 10, 0, Math.PI * 2);
       ctx.fillStyle = isSelected ? 'rgba(124,252,138,0.2)' : 'rgba(26,26,40,0.9)';
       ctx.strokeStyle = isSelected ? '#7cfc8a' : '#3a3a60';
       ctx.lineWidth = isSelected ? 2 : 1;
@@ -635,7 +803,7 @@ const Network = {
       // Name
       ctx.font = '9px Space Mono, monospace';
       ctx.fillStyle = 'rgba(112,112,160,0.8)';
-      ctx.fillText(node.name?.slice(0,12) || '?', node.x, node.y + 18);
+      ctx.fillText(node.name?.slice(0, 12) || '?', node.x, node.y + 18);
     }
   }
 };
@@ -666,26 +834,26 @@ const QR = {
 
     // Finder patterns (hörn)
     const drawFinder = (x, y) => {
-      ctx.fillRect(x, y, cellSize*7, cellSize*7);
+      ctx.fillRect(x, y, cellSize * 7, cellSize * 7);
       ctx.fillStyle = '#fff';
-      ctx.fillRect(x+cellSize, y+cellSize, cellSize*5, cellSize*5);
+      ctx.fillRect(x + cellSize, y + cellSize, cellSize * 5, cellSize * 5);
       ctx.fillStyle = '#000';
-      ctx.fillRect(x+cellSize*2, y+cellSize*2, cellSize*3, cellSize*3);
+      ctx.fillRect(x + cellSize * 2, y + cellSize * 2, cellSize * 3, cellSize * 3);
     };
     drawFinder(offset, offset);
-    drawFinder(size - offset - cellSize*7, offset);
-    drawFinder(offset, size - offset - cellSize*7);
+    drawFinder(size - offset - cellSize * 7, offset);
+    drawFinder(offset, size - offset - cellSize * 7);
 
     // Data-celler (pseudo-slumpmässiga baserat på texten)
     let rng = seed;
     for (let row = 0; row < cells; row++) {
       for (let col = 0; col < cells; col++) {
         // Hoppa över finder-pattern-zoner
-        if ((row < 9 && col < 9) || (row < 9 && col > cells-9) || (row > cells-9 && col < 9)) continue;
+        if ((row < 9 && col < 9) || (row < 9 && col > cells - 9) || (row > cells - 9 && col < 9)) continue;
         rng = (rng * 1664525 + 1013904223) & 0xffffffff;
         if (rng % 3 === 0) {
           ctx.fillStyle = '#000';
-          ctx.fillRect(offset + col * cellSize, offset + row * cellSize, cellSize-0.5, cellSize-0.5);
+          ctx.fillRect(offset + col * cellSize, offset + row * cellSize, cellSize - 0.5, cellSize - 0.5);
         }
       }
     }
@@ -694,7 +862,7 @@ const QR = {
     ctx.fillStyle = '#333';
     ctx.font = `bold 8px monospace`;
     ctx.textAlign = 'center';
-    ctx.fillText('MYCEL', size/2, size - 4);
+    ctx.fillText('MYCEL', size / 2, size - 4);
   }
 };
 
@@ -865,8 +1033,8 @@ const UI = {
     if (shards.length > 0) {
       shardList.innerHTML = shards.map((_, i) => `
         <div class="recovery-shard">
-          <div class="shard-peer">Fragment ${i+1} av ${shards.length}</div>
-          <div class="shard-hash">${shards[i].slice(0,32)}…</div>
+          <div class="shard-peer">Fragment ${i + 1} av ${shards.length}</div>
+          <div class="shard-hash">${shards[i].slice(0, 32)}…</div>
         </div>
       `).join('');
     } else {
@@ -933,16 +1101,16 @@ const SW = {
 // ══════════════════════════════════════════════════════════
 function escHtml(str) {
   return String(str)
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
 
 function timeAgo(ts) {
   const s = Math.floor((Date.now() - ts) / 1000);
   if (s < 60) return 'just nu';
-  if (s < 3600) return `${Math.floor(s/60)} min sedan`;
-  if (s < 86400) return `${Math.floor(s/3600)} h sedan`;
-  return `${Math.floor(s/86400)} d sedan`;
+  if (s < 3600) return `${Math.floor(s / 60)} min sedan`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h sedan`;
+  return `${Math.floor(s / 86400)} d sedan`;
 }
 
 // ══════════════════════════════════════════════════════════
@@ -966,14 +1134,21 @@ async function init() {
     if (peerParam) {
       try {
         const peerData = JSON.parse(atob(peerParam));
+        // Om inbjudan innehåller signaleringsserver — spara och anslut
+        if (peerData.signalingUrl) {
+          localStorage.setItem('mycel-signal-url', peerData.signalingUrl);
+          if (peerData.signalingUrl !== Signaling.serverUrl) {
+            Signaling.connect(peerData.signalingUrl).catch(() => { });
+          }
+        }
         setTimeout(() => {
           if (confirm(`Anslut till ${peerData.name}?`)) {
             Peers.connectToPeer(peerData);
           }
-        }, 800);
+        }, 1500); // ge WebSocket-anslutning tid att öppnas
         // Rensa URL
         history.replaceState({}, '', location.pathname);
-      } catch {}
+      } catch { }
     }
 
     // Periodisk status-uppdatering
@@ -1009,7 +1184,7 @@ async function init() {
       );
       UI.renderFeed();
       UI.toast('🎉 Välkommen till Mycel!', 'success');
-    } catch(err) {
+    } catch (err) {
       UI.toast('Fel: ' + err.message, 'error');
       btn.disabled = false;
     }
@@ -1041,7 +1216,7 @@ async function init() {
       Gossip.broadcast({ type: 'post', post });
       UI.toast('✓ Inlägg publicerat och gossipat', 'success');
       UI.updateStats();
-    } catch(err) {
+    } catch (err) {
       UI.toast('Fel: ' + err.message, 'error');
     } finally {
       btn.disabled = false;
@@ -1142,6 +1317,19 @@ async function init() {
     Gossip.active = !Gossip.active;
     e.target.textContent = Gossip.active ? 'Aktivt ✓' : 'Inaktivt';
     UI.toast(Gossip.active ? '📡 Gossip-protokoll aktiverat' : '🔇 Gossip pausat', 'info');
+  });
+
+  // Signaleringsserver URL — spara och anslut vid ändring
+  document.getElementById('signal-server-url')?.addEventListener('change', async (e) => {
+    const serverUrl = e.target.value.trim();
+    if (!serverUrl) return;
+    localStorage.setItem('mycel-signal-url', serverUrl);
+    try {
+      await Signaling.connect(serverUrl);
+      UI.toast('✓ Ansluten till signaleringsservern', 'success');
+    } catch (err) {
+      UI.toast('⚠ Kunde inte ansluta: ' + err.message, 'error');
+    }
   });
 }
 

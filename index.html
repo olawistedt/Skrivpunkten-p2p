@@ -675,6 +675,10 @@
   <div id="screen-peers" class="screen">
     <div class="card highlight">
       <div class="section-title">Min QR-inbjudan</div>
+      <p class="text-muted" style="font-size:11px;margin-bottom:8px;">
+        ⚠️ Inbjudningslänken innehåller din signaleringsserver-URL. Se till att servern körs
+        och är nåbar för din vän innan du delar länken.
+      </p>
       <div class="text-center mt-8">
         <canvas id="qr-canvas" class="qr-box" width="180" height="180"></canvas>
       </div>
@@ -758,6 +762,15 @@
 
     <div class="card mt-12">
       <div class="section-title">Inställningar</div>
+      <div class="form-group mt-8">
+        <label class="form-label">Signaleringsserver (WebSocket-URL)</label>
+        <input type="text" id="signal-server-url" placeholder="ws://localhost:8080" />
+        <p class="text-muted mt-8" style="font-size:10px;">
+          Kör <code style="background:var(--bg-raised);padding:1px 4px;border-radius:3px;">node server.js</code> lokalt, eller exponera med
+          <code style="background:var(--bg-raised);padding:1px 4px;border-radius:3px;">npx localtunnel --port 8080</code> för internetanslutning.
+        </p>
+      </div>
+      <hr />
       <div class="flex justify-between items-center mt-8">
         <span style="font-size:12px;">Offline-First läge</span>
         <button class="btn btn-ghost btn-sm" id="btn-toggle-offline-mode">Aktivt ✓</button>
