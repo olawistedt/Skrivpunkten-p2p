@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0a0a0f" />
+  <title>Mycel — Decentraliserat Socialt Nätverk</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet" />
+  <style>
+    /* ═══════════════════════════════════════════════
+       DESIGN SYSTEM — MYCEL
+       Aesthetic: Organisk Brutalitet — mycelium som
+       vävs genom mörka lager, bioluminescent accenter
+    ═══════════════════════════════════════════════ */
+    :root {
+      --bg-deep:      #060609;
+      --bg-mid:       #0d0d14;
+      --bg-surface:   #13131e;
+      --bg-raised:    #1a1a28;
+      --border:       #252535;
+      --border-glow:  #3a3a60;
+      --text-primary: #e8e8f0;
+      --text-muted:   #7070a0;
+      --text-faint:   #404060;
+      --accent:       #7cfc8a;
+      --accent-dim:   #3a7a42;
+      --accent-glow:  rgba(124,252,138,0.12);
+      --warn:         #fc8a7c;
+      --info:         #7cc4fc;
+      --font-display: 'Syne', sans-serif;
+      --font-mono:    'Space Mono', monospace;
+      --radius-sm:    4px;
+      --radius-md:    8px;
+      --radius-lg:    16px;
+      --transition:   200ms cubic-bezier(0.4,0,0.2,1);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--bg-deep);
+      color: var(--text-primary);
+      font-family: var(--font-mono);
+      font-size: 14px;
+      line-height: 1.6;
+      min-height: 100dvh;
+      overflow-x: hidden;
+    }
+
+    /* Ambient mycelium background */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 60% 40% at 20% 80%, rgba(124,252,138,0.04) 0%, transparent 60%),
+        radial-gradient(ellipse 40% 60% at 80% 20%, rgba(124,196,252,0.03) 0%, transparent 60%),
+        radial-gradient(ellipse 80% 80% at 50% 50%, rgba(13,13,20,0.8) 0%, transparent 100%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ── Layout ── */
+    #app {
+      position: relative;
+      z-index: 1;
+      max-width: 680px;
+      margin: 0 auto;
+      padding: 0 16px 120px;
+    }
+
+    /* ── Header ── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 20px 0 16px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 24px;
+    }
+
+    .logo {
+      font-family: var(--font-display);
+      font-size: 22px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      color: var(--accent);
+      text-shadow: 0 0 20px rgba(124,252,138,0.4);
+    }
+
+    .logo span { color: var(--text-muted); font-weight: 400; font-size: 13px; display: block; letter-spacing: 0.05em; }
+
+    .header-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .status-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--text-faint);
+      transition: background var(--transition);
+    }
+    .status-dot.online { background: var(--accent); box-shadow: 0 0 6px var(--accent); animation: pulse 2s infinite; }
+    .status-dot.syncing { background: var(--info); animation: pulse 0.8s infinite; }
+
+    @keyframes pulse {
+      0%,100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    /* ── Screens ── */
+    .screen { display: none; }
+    .screen.active { display: block; animation: fadeIn 300ms ease; }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 20px;
+      margin-bottom: 12px;
+      transition: border-color var(--transition);
+    }
+    .card:hover { border-color: var(--border-glow); }
+    .card.highlight { border-color: var(--accent-dim); background: linear-gradient(135deg, var(--bg-surface), rgba(124,252,138,0.03)); }
+
+    /* ── Buttons ── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 10px 18px;
+      border-radius: var(--radius-md);
+      border: 1px solid transparent;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all var(--transition);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #050a06;
+      border-color: var(--accent);
+    }
+    .btn-primary:hover {
+      background: #a0ffae;
+      box-shadow: 0 0 20px rgba(124,252,138,0.3);
+      transform: translateY(-1px);
+    }
+    .btn-ghost {
+      background: transparent;
+      color: var(--text-muted);
+      border-color: var(--border);
+    }
+    .btn-ghost:hover { border-color: var(--border-glow); color: var(--text-primary); }
+    .btn-danger {
+      background: transparent;
+      color: var(--warn);
+      border-color: rgba(252,138,124,0.3);
+    }
+    .btn-danger:hover { background: rgba(252,138,124,0.1); }
+    .btn-sm { padding: 6px 12px; font-size: 11px; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none !important; }
+
+    /* ── Inputs ── */
+    input[type="text"], textarea {
+      width: 100%;
+      background: var(--bg-mid);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      color: var(--text-primary);
+      font-family: var(--font-mono);
+      font-size: 13px;
+      padding: 12px 14px;
+      outline: none;
+      transition: border-color var(--transition), box-shadow var(--transition);
+    }
+    input[type="text"]:focus, textarea:focus {
+      border-color: var(--accent-dim);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+    textarea { resize: vertical; min-height: 80px; line-height: 1.5; }
+
+    /* ── Section titles ── */
+    .section-title {
+      font-family: var(--font-display);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .section-title::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+
+    /* ═══════════════════════════════════
+       ONBOARDING SCREEN
+    ═══════════════════════════════════ */
+    #screen-onboard .hero {
+      text-align: center;
+      padding: 48px 0 32px;
+    }
+    .hero-icon {
+      font-size: 64px;
+      display: block;
+      margin-bottom: 16px;
+      filter: drop-shadow(0 0 20px rgba(124,252,138,0.3));
+    }
+    .hero h1 {
+      font-family: var(--font-display);
+      font-size: 42px;
+      font-weight: 800;
+      letter-spacing: -2px;
+      line-height: 1;
+      color: var(--text-primary);
+      margin-bottom: 8px;
+    }
+    .hero h1 em {
+      color: var(--accent);
+      font-style: normal;
+    }
+    .hero p {
+      color: var(--text-muted);
+      font-size: 13px;
+      max-width: 360px;
+      margin: 0 auto 32px;
+      line-height: 1.7;
+    }
+    .feature-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 28px;
+    }
+    .feature-item {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 14px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .feature-item strong {
+      display: block;
+      color: var(--text-primary);
+      font-family: var(--font-display);
+      font-size: 13px;
+      margin-bottom: 3px;
+    }
+
+    .onboard-form { max-width: 400px; margin: 0 auto; }
+    .form-group { margin-bottom: 14px; }
+    .form-label { font-size: 11px; color: var(--text-muted); margin-bottom: 6px; display: block; letter-spacing: 0.05em; }
+
+    /* ═══════════════════════════════════
+       FEED SCREEN
+    ═══════════════════════════════════ */
+    .compose-box {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 16px;
+      margin-bottom: 20px;
+    }
+    .compose-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .avatar {
+      width: 34px; height: 34px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent-dim), var(--border-glow));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      flex-shrink: 0;
+    }
+    .compose-name { font-size: 12px; color: var(--text-muted); }
+    .compose-name strong { color: var(--text-primary); display: block; }
+    .compose-actions { display: flex; gap: 8px; margin-top: 10px; justify-content: flex-end; align-items: center; }
+    .char-count { font-size: 11px; color: var(--text-faint); flex: 1; }
+    .char-count.warn { color: var(--warn); }
+
+    /* Post cards */
+    .post-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 16px;
+      margin-bottom: 10px;
+      transition: border-color var(--transition);
+    }
+    .post-card:hover { border-color: var(--border-glow); }
+    .post-header {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .post-author { flex: 1; }
+    .post-author strong {
+      display: block;
+      font-size: 13px;
+      font-family: var(--font-display);
+    }
+    .post-author span { font-size: 10px; color: var(--text-faint); }
+    .post-sig {
+      font-size: 10px;
+      color: var(--accent-dim);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .post-content {
+      font-size: 14px;
+      line-height: 1.65;
+      color: var(--text-primary);
+      margin-bottom: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .post-footer {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 11px;
+      color: var(--text-faint);
+      border-top: 1px solid var(--border);
+      padding-top: 10px;
+    }
+    .post-footer .hops { margin-left: auto; }
+    .post-action-btn {
+      background: none;
+      border: none;
+      color: var(--text-faint);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: var(--radius-sm);
+      transition: all var(--transition);
+    }
+    .post-action-btn:hover { color: var(--text-primary); background: var(--bg-raised); }
+    .post-action-btn.liked { color: var(--warn); }
+
+    /* ═══════════════════════════════════
+       PEERS SCREEN
+    ═══════════════════════════════════ */
+    .peer-card {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 14px;
+      margin-bottom: 8px;
+    }
+    .peer-info { flex: 1; }
+    .peer-info strong { font-size: 13px; display: block; }
+    .peer-info span { font-size: 10px; color: var(--text-faint); font-family: var(--font-mono); }
+    .peer-status {
+      font-size: 10px;
+      padding: 3px 8px;
+      border-radius: 20px;
+      background: var(--bg-raised);
+      color: var(--text-muted);
+    }
+    .peer-status.online { background: rgba(124,252,138,0.1); color: var(--accent); }
+    .peer-status.recent { background: rgba(124,196,252,0.1); color: var(--info); }
+
+    .qr-box {
+      background: white;
+      border-radius: var(--radius-md);
+      padding: 16px;
+      display: inline-block;
+      margin: 0 auto;
+    }
+
+    .invite-link-box {
+      background: var(--bg-mid);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 12px 14px;
+      font-size: 11px;
+      color: var(--text-muted);
+      word-break: break-all;
+      font-family: var(--font-mono);
+    }
+
+    /* ═══════════════════════════════════
+       IDENTITY / SETTINGS SCREEN
+    ═══════════════════════════════════ */
+    .identity-pubkey {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--accent);
+      word-break: break-all;
+      background: var(--bg-mid);
+      padding: 10px 12px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--accent-dim);
+      margin-top: 6px;
+    }
+
+    .recovery-shard {
+      background: var(--bg-mid);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 10px 12px;
+      margin-bottom: 6px;
+      font-size: 11px;
+    }
+    .recovery-shard .shard-peer { color: var(--text-primary); font-size: 12px; }
+    .recovery-shard .shard-hash { color: var(--text-faint); font-size: 10px; font-family: var(--font-mono); }
+
+    /* ═══════════════════════════════════
+       BOTTOM NAV
+    ═══════════════════════════════════ */
+    #bottom-nav {
+      position: fixed;
+      bottom: 0; left: 0; right: 0;
+      background: rgba(6,6,9,0.92);
+      backdrop-filter: blur(20px);
+      border-top: 1px solid var(--border);
+      padding: 8px 0 env(safe-area-inset-bottom, 8px);
+      z-index: 100;
+    }
+    .nav-items {
+      display: flex;
+      justify-content: space-around;
+      max-width: 400px;
+      margin: 0 auto;
+    }
+    .nav-btn {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 3px;
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 6px 16px;
+      border-radius: var(--radius-md);
+      color: var(--text-faint);
+      font-family: var(--font-mono);
+      font-size: 9px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      transition: all var(--transition);
+    }
+    .nav-btn .icon { font-size: 20px; line-height: 1; }
+    .nav-btn:hover { color: var(--text-muted); }
+    .nav-btn.active { color: var(--accent); }
+    .nav-btn .badge {
+      position: absolute;
+      top: -2px; right: -2px;
+      background: var(--accent);
+      color: #050a06;
+      font-size: 8px;
+      width: 14px; height: 14px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+    }
+    .nav-icon-wrap { position: relative; }
+
+    /* ═══════════════════════════════════
+       NETWORK VISUALIZER
+    ═══════════════════════════════════ */
+    #network-canvas {
+      width: 100%;
+      height: 200px;
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--border);
+      background: var(--bg-mid);
+      display: block;
+    }
+
+    /* ═══════════════════════════════════
+       TOASTS
+    ═══════════════════════════════════ */
+    #toast-container {
+      position: fixed;
+      top: 16px; right: 16px;
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .toast {
+      background: var(--bg-raised);
+      border: 1px solid var(--border-glow);
+      border-radius: var(--radius-md);
+      padding: 10px 16px;
+      font-size: 12px;
+      max-width: 280px;
+      animation: slideIn 200ms ease;
+    }
+    .toast.success { border-color: var(--accent-dim); color: var(--accent); }
+    .toast.error   { border-color: rgba(252,138,124,0.4); color: var(--warn); }
+    .toast.info    { border-color: rgba(124,196,252,0.4); color: var(--info); }
+    @keyframes slideIn {
+      from { opacity:0; transform: translateX(20px); }
+      to   { opacity:1; transform: translateX(0); }
+    }
+
+    /* Misc utils */
+    .text-muted { color: var(--text-muted); }
+    .text-accent { color: var(--accent); }
+    .text-center { text-align: center; }
+    .mt-8  { margin-top: 8px; }
+    .mt-12 { margin-top: 12px; }
+    .mt-16 { margin-top: 16px; }
+    .mt-24 { margin-top: 24px; }
+    .mb-8  { margin-bottom: 8px; }
+    .flex  { display: flex; }
+    .flex-col { flex-direction: column; }
+    .gap-8 { gap: 8px; }
+    .gap-12 { gap: 12px; }
+    .items-center { align-items: center; }
+    .justify-between { justify-content: space-between; }
+    .w-full { width: 100%; }
+    hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+    small { font-size: 10px; }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    /* Install banner */
+    #install-banner {
+      display: none;
+      background: linear-gradient(135deg, rgba(124,252,138,0.08), rgba(124,252,138,0.03));
+      border: 1px solid var(--accent-dim);
+      border-radius: var(--radius-md);
+      padding: 12px 16px;
+      margin-bottom: 16px;
+      font-size: 12px;
+      align-items: center;
+      gap: 12px;
+    }
+    #install-banner.show { display: flex; }
+
+    @media (max-width: 400px) {
+      .hero h1 { font-size: 32px; }
+      .feature-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<div id="toast-container"></div>
+
+<div id="app">
+  <header>
+    <div class="logo">
+      🍄 Mycel
+      <span>p2p · krypterat · ditt</span>
+    </div>
+    <div class="header-status">
+      <div class="status-dot" id="connection-dot"></div>
+      <span id="connection-label">Offline</span>
+    </div>
+  </header>
+
+  <!-- ═══ ONBOARDING ═══ -->
+  <div id="screen-onboard" class="screen active">
+    <div class="hero">
+      <span class="hero-icon">🌿</span>
+      <h1>Det <em>sociala</em><br>nätverket<br>du äger</h1>
+      <p>Inget bolag. Inga servrar. Din identitet bygger på kryptografi. Din data lever på din telefon.</p>
+    </div>
+
+    <div class="feature-grid">
+      <div class="feature-item">
+        <strong>🔐 Kryptografisk ID</strong>
+        Asymmetrisk nyckel. Ingen kan utge sig för att vara du.
+      </div>
+      <div class="feature-item">
+        <strong>📡 Peer-to-Peer</strong>
+        WebRTC — enheter pratar direkt med varandra.
+      </div>
+      <div class="feature-item">
+        <strong>📵 Offline-First</strong>
+        Fungerar utan internet. Synkas när du möter andra.
+      </div>
+      <div class="feature-item">
+        <strong>🤝 Social Recovery</strong>
+        Tappa telefonen? Betrodda vänner återställer din identitet.
+      </div>
+    </div>
+
+    <div class="onboard-form card">
+      <div class="section-title">Skapa din identitet</div>
+      <div class="form-group">
+        <label class="form-label">Visningsnamn</label>
+        <input type="text" id="onboard-name" placeholder="T.ex. Erik Eriksson" maxlength="40" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Biografi (valfri)</label>
+        <input type="text" id="onboard-bio" placeholder="Kort beskrivning av dig" maxlength="100" />
+      </div>
+      <div id="key-gen-status" class="text-muted mt-8" style="font-size:11px;min-height:18px;"></div>
+      <button class="btn btn-primary w-full mt-12" id="btn-create-identity">
+        🔑 Generera nycklar & gå med
+      </button>
+      <p class="text-muted text-center mt-8" style="font-size:10px;">
+        Dina nycklar genereras lokalt och lämnar aldrig din enhet.
+      </p>
+    </div>
+  </div>
+
+  <!-- ═══ FEED ═══ -->
+  <div id="screen-feed" class="screen">
+    <div id="install-banner">
+      <span>📲 Installera Mycel som app</span>
+      <button class="btn btn-primary btn-sm" id="btn-install">Installera</button>
+      <button class="btn btn-ghost btn-sm" id="btn-install-dismiss">✕</button>
+    </div>
+
+    <div class="compose-box">
+      <div class="compose-meta">
+        <div class="avatar" id="compose-avatar">?</div>
+        <div class="compose-name">
+          <strong id="compose-name-display">—</strong>
+          <span id="compose-pubkey-short" class="text-accent"></span>
+        </div>
+      </div>
+      <textarea id="compose-text" placeholder="Vad tänker du på?&#10;&#10;Ditt inlägg signeras kryptografiskt och sprids via gossip-protokollet." maxlength="500"></textarea>
+      <div class="compose-actions">
+        <span class="char-count" id="char-count">0 / 500</span>
+        <button class="btn btn-ghost btn-sm" id="btn-broadcast-offline">📡 Offline-läge</button>
+        <button class="btn btn-primary btn-sm" id="btn-post">✍ Publicera</button>
+      </div>
+    </div>
+
+    <div class="section-title" id="feed-label">Flöde</div>
+    <div id="feed-list">
+      <!-- Posts injected here -->
+    </div>
+  </div>
+
+  <!-- ═══ PEERS ═══ -->
+  <div id="screen-peers" class="screen">
+    <div class="card highlight">
+      <div class="section-title">Min QR-inbjudan</div>
+      <div class="text-center mt-8">
+        <canvas id="qr-canvas" class="qr-box" width="180" height="180"></canvas>
+      </div>
+      <p class="text-muted text-center mt-8" style="font-size:11px;">
+        Låt en vän skanna för att ansluta direkt
+      </p>
+      <div class="invite-link-box mt-8" id="invite-link-text">—</div>
+      <div class="flex gap-8 mt-12">
+        <button class="btn btn-ghost btn-sm w-full" id="btn-copy-invite">📋 Kopiera länk</button>
+        <button class="btn btn-primary btn-sm w-full" id="btn-share-invite">↑ Dela</button>
+      </div>
+    </div>
+
+    <div class="card mt-12">
+      <div class="section-title">Anslut via länk</div>
+      <input type="text" id="peer-invite-input" placeholder="Klistra in inbjudningslänk..." />
+      <button class="btn btn-primary btn-sm mt-8 w-full" id="btn-connect-peer">🤝 Anslut</button>
+    </div>
+
+    <div class="section-title mt-16">Mina peers</div>
+    <div id="peers-list">
+      <div class="card text-muted text-center" style="font-size:12px;">
+        Inga peers ännu — dela din QR-kod för att komma igång.
+      </div>
+    </div>
+
+    <div class="section-title mt-16">Nätverksgraf</div>
+    <canvas id="network-canvas"></canvas>
+    <p class="text-muted mt-8" style="font-size:10px;text-align:center;">
+      Varje nod är en enhet. Kanter = aktiva gossip-kanaler.
+    </p>
+  </div>
+
+  <!-- ═══ IDENTITET ═══ -->
+  <div id="screen-identity" class="screen">
+    <div class="card highlight">
+      <div class="section-title">Din identitet</div>
+      <div class="flex gap-12 items-center">
+        <div class="avatar" id="id-avatar" style="width:48px;height:48px;font-size:22px;">?</div>
+        <div>
+          <div style="font-family:var(--font-display);font-size:18px;font-weight:700;" id="id-name">—</div>
+          <div class="text-muted" style="font-size:12px;" id="id-bio">—</div>
+        </div>
+      </div>
+      <div class="form-label mt-12">Publik nyckel (din adress i nätverket)</div>
+      <div class="identity-pubkey" id="id-pubkey-full">—</div>
+      <div class="flex gap-8 mt-12">
+        <button class="btn btn-ghost btn-sm" id="btn-export-key">💾 Exportera nyckel</button>
+        <button class="btn btn-ghost btn-sm" id="btn-edit-profile">✏ Redigera</button>
+      </div>
+    </div>
+
+    <div class="card mt-12">
+      <div class="section-title">Social Recovery</div>
+      <p class="text-muted" style="font-size:12px;margin-bottom:12px;">
+        Dela krypterade fragment av din återställningsnyckel med betrodda vänner. Du behöver minst 2 av 3 fragment för att återskapa din identitet.
+      </p>
+      <div id="recovery-shards-list"></div>
+      <button class="btn btn-ghost btn-sm w-full mt-8" id="btn-setup-recovery">
+        🛡 Konfigurera Social Recovery
+      </button>
+    </div>
+
+    <div class="card mt-12">
+      <div class="section-title">Data & Statistik</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;text-align:center;">
+        <div>
+          <div style="font-family:var(--font-display);font-size:24px;font-weight:700;color:var(--accent);" id="stat-posts">0</div>
+          <div class="text-muted" style="font-size:10px;">Inlägg</div>
+        </div>
+        <div>
+          <div style="font-family:var(--font-display);font-size:24px;font-weight:700;color:var(--info);" id="stat-peers">0</div>
+          <div class="text-muted" style="font-size:10px;">Peers</div>
+        </div>
+        <div>
+          <div style="font-family:var(--font-display);font-size:24px;font-weight:700;color:var(--warn);" id="stat-kb">0</div>
+          <div class="text-muted" style="font-size:10px;">KB data</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mt-12">
+      <div class="section-title">Inställningar</div>
+      <div class="flex justify-between items-center mt-8">
+        <span style="font-size:12px;">Offline-First läge</span>
+        <button class="btn btn-ghost btn-sm" id="btn-toggle-offline-mode">Aktivt ✓</button>
+      </div>
+      <div class="flex justify-between items-center mt-8">
+        <span style="font-size:12px;">Gossip-protokoll</span>
+        <button class="btn btn-ghost btn-sm" id="btn-toggle-gossip">Aktivt ✓</button>
+      </div>
+      <div class="flex justify-between items-center mt-8">
+        <span style="font-size:12px;">PWA Service Worker</span>
+        <span class="text-muted" style="font-size:11px;" id="sw-status">Kontrollerar...</span>
+      </div>
+      <hr />
+      <button class="btn btn-danger btn-sm w-full" id="btn-reset-identity">
+        ⚠ Radera identitet & data
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Bottom nav (hidden initially) -->
+<nav id="bottom-nav" style="display:none;">
+  <div class="nav-items">
+    <button class="nav-btn active" data-screen="feed">
+      <span class="nav-icon-wrap">
+        <span class="icon">🏠</span>
+      </span>
+      Flöde
+    </button>
+    <button class="nav-btn" data-screen="peers">
+      <span class="nav-icon-wrap">
+        <span class="icon">📡</span>
+        <span class="badge" id="peer-badge" style="display:none">0</span>
+      </span>
+      Peers
+    </button>
+    <button class="nav-btn" data-screen="identity">
+      <span class="nav-icon-wrap">
+        <span class="icon">🔐</span>
+      </span>
+      Identitet
+    </button>
+  </div>
+</nav>
+
+<script src="app.js"></script>
+</body>
+</html>
