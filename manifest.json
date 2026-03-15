@@ -1,6 +1,6 @@
 {
-  "name": "Mycel — Decentraliserat Socialt Nätverk",
-  "short_name": "Mycel",
+  "name": "Skrivpunkten — Decentraliserat Socialt Nätverk",
+  "short_name": "Skrivpunkten",
   "description": "Ett peer-to-peer socialt nätverk utan central server. Din identitet, din data.",
   "start_url": "/",
   "display": "standalone",

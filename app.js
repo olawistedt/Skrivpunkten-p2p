@@ -461,7 +461,7 @@ const ManualSignaling = {
    */
   async acceptOffer(encoded) {
     let data;
-    try { data = JSON.parse(atob(encoded.trim())); } catch { throw new Error('Ogiltig inbjudningskod'); }
+    try { data = JSON.parse(atob(encoded.replace(/\s+/g, ''))); } catch { throw new Error('Ogiltig inbjudningskod'); }
     if (data.t !== 'o') throw new Error('Det här är ett svar, inte en inbjudan');
     if (data.pk === Identity.current?.pubkey) throw new Error('Det är din egen nyckel!');
 
@@ -494,7 +494,7 @@ const ManualSignaling = {
    */
   async acceptAnswer(encoded) {
     let data;
-    try { data = JSON.parse(atob(encoded.trim())); } catch { throw new Error('Ogiltig svarskod'); }
+    try { data = JSON.parse(atob(encoded.replace(/\s+/g, ''))); } catch { throw new Error('Ogiltig svarskod'); }
     if (data.t !== 'a') throw new Error('Det här är en inbjudan, inte ett svar');
 
     const pending = ManualSignaling._pending.get(data.id);
@@ -519,7 +519,7 @@ const ManualSignaling = {
   /** Autodetektera om inklistrad kod är inbjudan eller svar, kör rätt funktion */
   async handlePastedCode(encoded) {
     let data;
-    try { data = JSON.parse(atob(encoded.trim())); } catch { throw new Error('Ogiltig kod'); }
+    try { data = JSON.parse(atob(encoded.replace(/\s+/g, ''))); } catch { throw new Error('Ogiltig kod'); }
     if (data.t === 'o') {
       const answerCode = await ManualSignaling.acceptOffer(encoded);
       return { action: 'answered', code: answerCode };
@@ -1122,10 +1122,10 @@ async function init() {
 
       // Demo-inlägg
       const welcome = await Posts.create(
-        `Hej världen! 🌿 Det här är mitt första inlägg på Mycel — det decentraliserade nätverket som jag äger. Inga servrar. Inga mellanhänder. Bara ren kryptografi och skvaller.`
+        `Hej världen! 🌿 Det här är mitt första inlägg på Skrivpunkten — det decentraliserade nätverket som jag äger. Inga servrar. Inga mellanhänder. Bara ren kryptografi och skvaller.`
       );
       UI.renderFeed();
-      UI.toast('🎉 Välkommen till Mycel!', 'success');
+      UI.toast('🎉 Välkommen till Skrivpunkten!', 'success');
     } catch (err) {
       UI.toast('Fel: ' + err.message, 'error');
       btn.disabled = false;

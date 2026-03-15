@@ -160,4 +160,4 @@ self.addEventListener('message', event => {
   }
 });
 
-console.log('[SW] Mycel Service Worker laddad — Offline-First är aktivt');
+console.log('[SW] Skrivpunkten Service Worker laddad — Offline-First är aktivt');
