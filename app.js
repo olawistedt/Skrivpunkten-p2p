@@ -368,6 +368,121 @@ const Peers = {
 // Ingen server krävs. Signaleringen sker via valfri kanal.
 const ManualSignaling = {
   _pending: new Map(), // tempId → { pc, peerRef }
+  _rcCodes: new Map(), // peerPubkey → { name, code } — automatiskt genererade återanslutningskoder
+
+  /** Bygger localStorage-nyckel för auto-återanslutning */
+  _lsKey(type, fromSlice, toSlice) {
+    return `mycel-rc-${type}-${fromSlice}-${toSlice}`;
+  },
+
+  /**
+   * Körs vid sidladdning för varje känd peer.
+   * Försöker återansluta automatiskt via localStorage (samma enhet)
+   * och genererar nya offer-koder att skicka manuellt (olika enheter).
+   */
+  async autoReconnect(savedPeers) {
+    if (!savedPeers.length || !Identity.current) return;
+    const myPk = Identity.current.pubkey;
+    const mySlice = myPk.slice(0, 16);
+
+    // Rensa utgångna localStorage-poster (> 2 h)
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (!k?.startsWith('mycel-rc-')) continue;
+      try {
+        const val = JSON.parse(localStorage.getItem(k));
+        if (val.ts && Date.now() - val.ts > 7200000) localStorage.removeItem(k);
+      } catch { localStorage.removeItem(k); }
+    }
+
+    // Lyssna på storage-events — automatiskt utbyte om båda flikar/fönster är öppna
+    window.addEventListener('storage', async (e) => {
+      if (!e.key?.startsWith('mycel-rc-') || !e.newValue) return;
+      const curPk = Identity.current?.pubkey;
+      if (!curPk) return;
+      const curSlice = curPk.slice(0, 16);
+
+      for (const peer of (await Peers.getAll())) {
+        const peerSlice = peer.pubkey.slice(0, 16);
+        // Inkommande offer (från peer till mig) — jag är responder
+        if (e.key === ManualSignaling._lsKey('o', peerSlice, curSlice)) {
+          try {
+            const { code } = JSON.parse(e.newValue);
+            const answerCode = await ManualSignaling.acceptOffer(code);
+            localStorage.setItem(
+              ManualSignaling._lsKey('a', curSlice, peerSlice),
+              JSON.stringify({ code: answerCode, ts: Date.now() })
+            );
+            localStorage.removeItem(e.key);
+          } catch { }
+          return;
+        }
+        // Inkommande answer (från peer till mig) — jag är initiator
+        if (e.key === ManualSignaling._lsKey('a', peerSlice, curSlice)) {
+          try {
+            const { code } = JSON.parse(e.newValue);
+            await ManualSignaling.acceptAnswer(code);
+            localStorage.removeItem(e.key);
+            ManualSignaling._rcCodes.delete(peer.pubkey);
+            UI.renderPeers();
+          } catch { }
+          return;
+        }
+      }
+    });
+
+    // Hantera varje känd peer
+    for (const peer of savedPeers) {
+      const peerSlice = peer.pubkey.slice(0, 16);
+      const conn = Peers.connections.get(peer.pubkey);
+      if (conn?.channel?.readyState === 'open') continue; // redan ansluten
+
+      // Bokstavsordning avgör vem som initerar (stabilt, undviker dubbla offer)
+      const iAmInitiator = myPk < peer.pubkey;
+
+      if (iAmInitiator) {
+        // Kolla om peer redan svarat på ett offer från den här sessionen
+        const savedAnswer = localStorage.getItem(ManualSignaling._lsKey('a', peerSlice, mySlice));
+        if (savedAnswer) {
+          try {
+            const { code } = JSON.parse(savedAnswer);
+            await ManualSignaling.acceptAnswer(code);
+            localStorage.removeItem(ManualSignaling._lsKey('a', peerSlice, mySlice));
+            continue;
+          } catch {
+            localStorage.removeItem(ManualSignaling._lsKey('a', peerSlice, mySlice));
+          }
+        }
+        // Generera ett nytt offer (skriver över eventuellt gammalt)
+        try {
+          const { code } = await ManualSignaling.createOffer();
+          localStorage.setItem(
+            ManualSignaling._lsKey('o', mySlice, peerSlice),
+            JSON.stringify({ code, ts: Date.now() })
+          );
+          ManualSignaling._rcCodes.set(peer.pubkey, { name: peer.name, code });
+        } catch { }
+      } else {
+        // Jag är responder — kolla om initiatorns offer finns redan
+        const savedOffer = localStorage.getItem(ManualSignaling._lsKey('o', peerSlice, mySlice));
+        if (savedOffer) {
+          try {
+            const { code } = JSON.parse(savedOffer);
+            const answerCode = await ManualSignaling.acceptOffer(code);
+            localStorage.setItem(
+              ManualSignaling._lsKey('a', mySlice, peerSlice),
+              JSON.stringify({ code: answerCode, ts: Date.now() })
+            );
+            localStorage.removeItem(ManualSignaling._lsKey('o', peerSlice, mySlice));
+            continue;
+          } catch { }
+        }
+        // Inget offer hittades ännu — storage-listener tar hand om det när det dyker upp
+      }
+    }
+
+    UI.renderPeers(); // Uppdatera UI med eventuella återanslutningskoder
+  },
 
   /** Skapar en WebRTC RTCPeerConnection och kopplar datalyssnare */
   _makePC(isInitiator, connKey, peerRef) {
@@ -515,10 +630,18 @@ const ManualSignaling = {
     pending.peerRef.pubkey = data.pk;
     pending.peerRef.name = data.n;
 
-    const entry = Peers.connections.get(data.id);
-    if (entry) {
-      Peers.connections.delete(data.id);
-      Peers.connections.set(data.pk, entry);
+    // Flytta connection-entry till rätt nyckel (tempId → pubkey)
+    const byId = Peers.connections.get(data.id);
+    if (byId) { Peers.connections.delete(data.id); Peers.connections.set(data.pk, byId); }
+    // Hantera fallet att onopen hann köra innan acceptAnswer (sparades under null-nyckeln)
+    const byNull = Peers.connections.get(null);
+    if (byNull) {
+      Peers.connections.delete(null);
+      Peers.connections.set(data.pk, byNull);
+      byNull.name = data.n;
+      if (byNull.channel?.readyState === 'open') {
+        setTimeout(() => Gossip.syncWithPeer(data.pk), 100);
+      }
     }
 
     await pending.pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
@@ -959,17 +1082,33 @@ const UI = {
         return;
       }
       list.innerHTML = peers.map(p => {
-        const isOnline = Peers.connections.has(p.pubkey);
+        const conn = Peers.connections.get(p.pubkey);
+        const isOnline = conn?.channel?.readyState === 'open';
         const statusClass = isOnline ? 'online' : '';
         const statusText = isOnline ? 'online' : 'frånkopplad';
-        return `
-          <div class="peer-card">
-            <div class="avatar">${Identity.avatarEmoji(p.pubkey)}</div>
-            <div class="peer-info">
-              <strong>${escHtml(p.name)}</strong>
-              <span>${Identity.shortKey(p.pubkey)}</span>
+        const rc = ManualSignaling._rcCodes.get(p.pubkey);
+        const rcSection = (!isOnline && rc) ? `
+          <div style="width:100%;margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">
+            <div style="font-size:10px;color:var(--text-muted);margin-bottom:6px;">
+              📡 Återanslutningskod — skicka till ${escHtml(p.name)}:
             </div>
-            <span class="peer-status ${statusClass}">${statusText}</span>
+            <div style="font-family:monospace;font-size:9px;word-break:break-all;background:var(--bg-secondary);padding:6px 8px;border-radius:6px;max-height:56px;overflow:auto;user-select:all;">${escHtml(rc.code)}</div>
+            <button class="btn btn-ghost btn-sm w-full" style="margin-top:6px;" onclick="navigator.clipboard?.writeText(${JSON.stringify(rc.code)}).then(()=>UI.toast('📋 Återanslutningskod kopierad!','success'))">
+              📋 Kopiera kod
+            </button>
+          </div>
+        ` : '';
+        return `
+          <div class="peer-card" style="flex-wrap:wrap;align-items:flex-start;">
+            <div style="display:flex;align-items:center;gap:10px;width:100%;">
+              <div class="avatar">${Identity.avatarEmoji(p.pubkey)}</div>
+              <div class="peer-info">
+                <strong>${escHtml(p.name)}</strong>
+                <span>${Identity.shortKey(p.pubkey)}</span>
+              </div>
+              <span class="peer-status ${statusClass}">${statusText}</span>
+            </div>
+            ${rcSection}
           </div>
         `;
       }).join('');
@@ -1102,6 +1241,9 @@ async function init() {
     Gossip.init();
     Network.init();
     SW.register();
+
+    // Automatisk återanslutning till kända peers
+    Peers.getAll().then(savedPeers => ManualSignaling.autoReconnect(savedPeers));
 
     // Rensa peer-param ur URL om den finns kvar från en gammal session
     const url = new URL(location.href);
