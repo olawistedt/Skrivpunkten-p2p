@@ -1093,7 +1093,7 @@ const UI = {
               📡 Återanslutningskod — skicka till ${escHtml(p.name)}:
             </div>
             <div style="font-family:monospace;font-size:9px;word-break:break-all;background:var(--bg-secondary);padding:6px 8px;border-radius:6px;max-height:56px;overflow:auto;user-select:all;">${escHtml(rc.code)}</div>
-            <button class="btn btn-ghost btn-sm w-full" style="margin-top:6px;" onclick="navigator.clipboard?.writeText(${JSON.stringify(rc.code)}).then(()=>UI.toast('📋 Återanslutningskod kopierad!','success'))">
+            <button class="btn btn-ghost btn-sm w-full" style="margin-top:6px;" data-copy-rc="${escHtml(p.pubkey)}">
               📋 Kopiera kod
             </button>
           </div>
@@ -1112,6 +1112,18 @@ const UI = {
           </div>
         `;
       }).join('');
+
+      // Koppla kopiera-lyssnare för återanslutningskoder (undviker HTML-injection i onclick)
+      list.querySelectorAll('[data-copy-rc]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const pk = btn.dataset.copyRc;
+          const entry = ManualSignaling._rcCodes.get(pk);
+          if (!entry) return;
+          navigator.clipboard?.writeText(entry.code)
+            .then(() => UI.toast('📋 Återanslutningskod kopierad!', 'success'))
+            .catch(() => UI.toast('Kunde inte kopiera automatiskt', 'error'));
+        });
+      });
 
       // Uppdatera badge
       const badge = document.getElementById('peer-badge');
