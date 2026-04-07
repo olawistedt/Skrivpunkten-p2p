@@ -1292,17 +1292,17 @@ const SW = {
 //   mycel/offer/{responderPubkey}  — offer från initiator (retained)
 //   mycel/answer/{initiatorPubkey} — svar från responder (retained)
 //
-// Flöde vid uppstart / page reload / stängd browser:
-//   1. Prenumerera på peers' online-ämnen + egna offer/answer-ämnen
-//   2. Skicka retained offer till alla kända peers (initiator) — direkt efter subscribe,
-//      oberoende av om de är online just nu. Offret väntar på brokern tills de öppnar.
-//   3. Publicera eget online-meddelande (retained) so att peers som öppnar senare
-//      ser oss direkt och reagerar.
-//   4. Respondern tar emot offer → skickar answer → initiator tar emot → P2P-kanal öppen.
+// Prenumerationsordning är avgörande:
+//   1. Rensa eventuellt kvarlämnat retained answer (från förra sessionen)
+//   2. Prenumerera på inkommande offer + peer-närvaro
+//   3. Skapa färska offer och fyll _pending (in-memory, tömt vid sidladdning)
+//   4. Prenumerera på answer EFTER att _pending är ifyllt
+//      → garanterar att alla svar som broker levererar matchar aktuell _pending
+//   5. Annonsera online-närvaro (retained)
 const MqttSignaling = {
   client: null,
   BROKER: 'wss://broker.emqx.io:8084/mqtt',
-  OFFER_TTL: 60 * 60 * 1000, // 1 h — offer/answer-meddelanden
+  OFFER_TTL: 60 * 60 * 1000, // 1 h
 
   async connect() {
     if (!Identity.current) return;
@@ -1321,44 +1321,51 @@ const MqttSignaling = {
       clean: true,
       reconnectPeriod: 5000,
       connectTimeout: 10000,
-      // LWT: brokern rensar online-retained om jag kopplas från oväntat
       will: { topic: myOnlineTopic, payload: '', retain: true, qos: 1 }
     });
     MqttSignaling.client = client;
 
     client.on('connect', async () => {
+      // Steg 1: Rensa kvarlämnat retained answer från förra sessionen.
+      // Detta måste göras INNAN vi prenumererar på answer-ämnet, annars riskerar
+      // vi att ta emot ett gammalt svar som inte matchar vår tomma _pending.
+      client.publish(`mycel/answer/${myPk}`, '', { retain: true, qos: 1 });
+
       const peers = await Peers.getAll();
-      const topics = [
+
+      // Steg 2: Prenumerera på offer och peer-närvaro (inte answer ännu)
+      const step2Topics = [
         `mycel/offer/${myPk}`,
-        `mycel/answer/${myPk}`,
         ...peers.map(p => `mycel/peer/${p.pubkey}/online`)
       ];
-      client.subscribe(topics, async () => {
-        // Skicka offer till alla disconnected peers direkt — oberoende av deras online-status.
-        // Retained offer väntar på brokern tills peern öppnar sin browser.
+
+      client.subscribe(step2Topics, async () => {
+        // Steg 3: Skapa offer för alla ej anslutna peers och fyll _pending
         await MqttSignaling._offerToDisconnectedPeers();
 
-        // Annonsera att jag är online (retained) — peers som öppnar sina browsers ser detta
-        // och kan trigga egna offers om de är initiator.
-        client.publish(
-          myOnlineTopic,
-          JSON.stringify({ pk: myPk, ts: Date.now() }),
-          { retain: true, qos: 1 }
-        );
+        // Steg 4: Prenumerera på answer — nu är _pending garanterat ifyllt.
+        // Brokern levererar retained answer direkt vid subscribe → matchar _pending.
+        client.subscribe(`mycel/answer/${myPk}`, () => {
+          // Steg 5: Annonsera närvaro (retained)
+          client.publish(
+            myOnlineTopic,
+            JSON.stringify({ pk: myPk, ts: Date.now() }),
+            { retain: true, qos: 1 }
+          );
+        });
       });
     });
 
     client.on('message', async (topic, payload) => {
       const raw = payload.toString();
 
-      // ── Närvaro: peer gick online ──
+      // ── Peer-närvaro ──
       const onlineMatch = topic.match(/^mycel\/peer\/([^/]+)\/online$/);
       if (onlineMatch) {
         const peerPk = onlineMatch[1];
-        if (peerPk === myPk) return;
-        if (!raw) return; // LWT / rensning — peer offline
-        // Ingen TTL-check här — se peer som känd oavsett när de senast var online.
-        // Om jag är initiator och ej ansluten, skicka offer (kanske redan skickat men uppdatera).
+        if (peerPk === myPk || !raw) return;
+        // Peer gick online — om jag är initiator och ej ansluten: skicka offer.
+        // Svar levereras via mycel/answer/${myPk} som vi prenumererar på.
         if (myPk < peerPk) {
           const conn = Peers.connections.get(peerPk);
           if (conn?.channel?.readyState !== 'open') {
@@ -1368,12 +1375,11 @@ const MqttSignaling = {
         return;
       }
 
-      // ── Offer / answer ──
-      if (!raw) return;
+      if (!raw) return; // retained rensning
       let msg; try { msg = JSON.parse(raw); } catch { return; }
       if (!msg?.from || msg.from === myPk) return;
       if (msg.ts && Date.now() - msg.ts > MqttSignaling.OFFER_TTL) {
-        client.publish(topic, '', { retain: true }); // rensa utgånget
+        client.publish(topic, '', { retain: true, qos: 1 });
         return;
       }
 
@@ -1386,7 +1392,7 @@ const MqttSignaling = {
         }
         try {
           const answerCode = await ManualSignaling.acceptOffer(msg.code);
-          client.publish(topic, '', { retain: true }); // rensa offer efter bruk
+          client.publish(topic, '', { retain: true });
           client.publish(
             `mycel/answer/${msg.from}`,
             JSON.stringify({ type: 'answer', from: myPk, code: answerCode, ts: Date.now() }),
@@ -1401,11 +1407,13 @@ const MqttSignaling = {
           client.publish(topic, '', { retain: true });
           return;
         }
-        client.publish(topic, '', { retain: true }); // rensa direkt
+        client.publish(topic, '', { retain: true });
         try {
           await ManualSignaling.acceptAnswer(msg.code);
-        } catch {
-          // _pending saknas (t.ex. efter page reload) — skicka nytt offer
+        } catch (err) {
+          // tempId saknas i _pending — kan inte hända med ny prenumerationsordning,
+          // men om det ändå sker: skicka nytt offer.
+          console.warn('MQTT answer-miss, skapar nytt offer:', err.message);
           await MqttSignaling._sendOfferTo(msg.from);
         }
       }
@@ -1414,16 +1422,26 @@ const MqttSignaling = {
     client.on('error', err => console.warn('MQTT-fel:', err.message));
   },
 
-  // Prenumerera på en nyligen tillagd peers närvaro (kallas när peer läggs till manuellt)
   subscribeToPeer(peerPubkey) {
     if (!MqttSignaling.client?.connected) return;
     MqttSignaling.client.subscribe(`mycel/peer/${peerPubkey}/online`);
+    // Trigger offer om vi är initiator
+    const myPk = Identity.current?.pubkey;
+    if (myPk && myPk < peerPubkey) MqttSignaling._sendOfferTo(peerPubkey);
+  },
+
+  async _offerToDisconnectedPeers() {
+    if (!MqttSignaling.client?.connected || !Identity.current) return;
+    const peers = await Peers.getAll();
+    for (const peer of peers) {
+      await MqttSignaling._sendOfferTo(peer.pubkey);
+    }
   },
 
   async _sendOfferTo(peerPk) {
     if (!MqttSignaling.client?.connected || !Identity.current) return;
     const myPk = Identity.current.pubkey;
-    if (myPk >= peerPk) return; // bara initiator (lägre pubkey) skickar offer
+    if (myPk >= peerPk) return;
     const conn = Peers.connections.get(peerPk);
     if (conn?.channel?.readyState === 'open') return;
     try {
