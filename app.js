@@ -428,6 +428,22 @@ const ManualSignaling = {
           } catch { }
           return;
         }
+        // Inkommande req (responder saknar offer) — jag är initiator, skapa nytt offer
+        if (e.key === ManualSignaling._lsKey('req', peerSlice, curSlice)) {
+          try {
+            localStorage.removeItem(e.key);
+            const conn = Peers.connections.get(peer.pubkey);
+            if (conn?.channel?.readyState === 'open') return;
+            const { code } = await ManualSignaling.createOffer();
+            localStorage.setItem(
+              ManualSignaling._lsKey('o', curSlice, peerSlice),
+              JSON.stringify({ code, ts: Date.now() })
+            );
+            ManualSignaling._rcCodes.set(peer.pubkey, { name: peer.name, code });
+            UI.renderPeers();
+          } catch { }
+          return;
+        }
       }
     });
 
@@ -477,7 +493,11 @@ const ManualSignaling = {
             continue;
           } catch { }
         }
-        // Inget offer hittades ännu — storage-listener tar hand om det när det dyker upp
+        // Inget offer hittades — signalera till initiator att vi vill återansluta
+        localStorage.setItem(
+          ManualSignaling._lsKey('req', mySlice, peerSlice),
+          JSON.stringify({ ts: Date.now() })
+        );
       }
     }
 
@@ -522,10 +542,31 @@ const ManualSignaling = {
       }
 
       ch.onclose = () => {
-        const entry = Peers.connections.get(peerRef.pubkey);
+        const pubkey = peerRef.pubkey;
+        const entry = Peers.connections.get(pubkey);
         if (entry) entry.channel = null;
         UI.renderPeers();
         UI.updateConnectionStatus(Peers.onlineCount() > 0);
+        // Automatisk återanslutning: initiator skapar nytt offer när kanalen stängs
+        if (isInitiator && pubkey) {
+          setTimeout(async () => {
+            const cur = Peers.connections.get(pubkey);
+            if (cur?.channel?.readyState === 'open') return;
+            try {
+              const { code } = await ManualSignaling.createOffer();
+              const mySlice = Identity.current?.pubkey?.slice(0, 16);
+              const peerSlice = pubkey.slice(0, 16);
+              if (mySlice && peerSlice) {
+                localStorage.setItem(
+                  ManualSignaling._lsKey('o', mySlice, peerSlice),
+                  JSON.stringify({ code, ts: Date.now() })
+                );
+                ManualSignaling._rcCodes.set(pubkey, { name: peerRef.name, code });
+                UI.renderPeers();
+              }
+            } catch { }
+          }, 1500);
+        }
       };
       ch.onmessage = async (e) => {
         let msg; try { msg = JSON.parse(e.data); } catch { return; }
