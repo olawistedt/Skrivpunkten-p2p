@@ -8,7 +8,10 @@
   "theme_color": "#0a0a0f",
   "orientation": "portrait-primary",
   "lang": "sv",
-  "categories": ["social", "communication"],
+  "categories": [
+    "social",
+    "communication"
+  ],
   "icons": [
     {
       "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'><rect width='192' height='192' fill='%230a0a0f' rx='24'/><text y='130' x='96' text-anchor='middle' font-size='120'>🍄</text></svg>",
@@ -26,7 +29,8 @@
   "screenshots": [],
   "share_target": {
     "action": "/",
-    "method": "GET",
+    "method": "POST",
+    "enctype": "application/x-www-form-urlencoded",
     "params": {
       "text": "peer"
     }

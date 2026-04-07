@@ -672,7 +672,199 @@ const ManualSignaling = {
 };
 
 // ══════════════════════════════════════════════════════════
-// 7. GOSSIP-PROTOKOLL
+// 7. SIGNALSERVER — Automatisk WebRTC-parning via WS-server
+// ══════════════════════════════════════════════════════════
+// Protokoll:
+//   join      → server   : { type:"join", pubkey, name, room }
+//   welcome   ← server   : { type:"welcome", peers:[{pubkey,name}] }
+//   peer_joined ← server : { type:"peer_joined", pubkey, name }
+//   peer_left ← server   : { type:"peer_left", pubkey }
+//   signal    → server   : { type:"signal", to, payload }
+//   relay     ← server   : { type:"relay", from, payload }
+const SignalServer = {
+  ws: null,
+  url: null,
+  room: null,
+  _pendingPCs: new Map(), // peerPubkey → { pc, peerRef }
+
+  get isConnected() {
+    return this.ws?.readyState === WebSocket.OPEN;
+  },
+
+  /** Anslut till signalservern och gå med i ett rum */
+  connect(url, room) {
+    if (!Identity.current) { UI.toast('Skapa en identitet först', 'error'); return; }
+    if (SignalServer.ws) SignalServer.disconnect();
+
+    SignalServer.url = url;
+    SignalServer.room = room;
+
+    let ws;
+    try {
+      ws = new WebSocket(url);
+    } catch {
+      UI.toast('⚠️ Ogiltig server-URL', 'error');
+      return;
+    }
+    SignalServer.ws = ws;
+    let _connected = false;
+
+    ws.onopen = () => {
+      _connected = true;
+      ws.send(JSON.stringify({
+        type: 'join',
+        pubkey: Identity.current.pubkey,
+        name: Identity.current.name,
+        room
+      }));
+      UI.updateSignalStatus('connected');
+      UI.toast('🔌 Ansluten till signalserver', 'success');
+      document.getElementById('btn-signal-connect').disabled = false;
+    };
+
+    ws.onmessage = async (e) => {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+      await SignalServer._handleMessage(msg);
+    };
+
+    ws.onclose = () => {
+      UI.updateSignalStatus('disconnected');
+      SignalServer.ws = null;
+      document.getElementById('btn-signal-connect').disabled = false;
+    };
+
+    ws.onerror = () => {
+      if (!_connected) {
+        UI.toast('⚠️ Kunde inte nå signalservern — är den igång? (node server.js)', 'error');
+      }
+      UI.updateSignalStatus('disconnected');
+    };
+  },
+
+  disconnect() {
+    SignalServer.ws?.close();
+    SignalServer.ws = null;
+    UI.updateSignalStatus('disconnected');
+  },
+
+  /** Hantera inkommande meddelanden från signalservern */
+  async _handleMessage(msg) {
+    switch (msg.type) {
+      // Lista av peers som redan är i rummet — jag initierar om min pubkey < deras
+      case 'welcome': {
+        for (const peer of (msg.peers || [])) {
+          if (peer.pubkey === Identity.current?.pubkey) continue;
+          if (Peers.connections.get(peer.pubkey)?.channel?.readyState === 'open') continue;
+          if (Identity.current.pubkey < peer.pubkey) {
+            await SignalServer._sendOffer(peer.pubkey, peer.name);
+          }
+        }
+        break;
+      }
+
+      // Ny peer gick med i rummet
+      case 'peer_joined': {
+        const { pubkey, name } = msg;
+        if (pubkey === Identity.current?.pubkey) return;
+        if (Peers.connections.get(pubkey)?.channel?.readyState === 'open') return;
+        if (Identity.current.pubkey < pubkey) {
+          await SignalServer._sendOffer(pubkey, name);
+        }
+        break;
+      }
+
+      // Vidarebefordrad signal (offer eller answer)
+      case 'relay': {
+        const { from, payload } = msg;
+        if (!from || !payload) return;
+        if (payload.type === 'offer') {
+          await SignalServer._handleOffer(from, payload);
+        } else if (payload.type === 'answer') {
+          await SignalServer._handleAnswer(from, payload);
+        }
+        break;
+      }
+
+      // Peer lämnade rummet — markera som frånkopplad
+      case 'peer_left': {
+        const entry = Peers.connections.get(msg.pubkey);
+        if (entry) { entry.channel = null; UI.renderPeers(); }
+        SignalServer._pendingPCs.delete(msg.pubkey);
+        break;
+      }
+    }
+  },
+
+  /** Skapa WebRTC offer och skicka via signalservern */
+  async _sendOffer(toPubkey, toName) {
+    if (SignalServer._pendingPCs.has(toPubkey)) return; // offer skapat redan
+    const peerRef = { pubkey: toPubkey, name: toName };
+    const pc = ManualSignaling._makePC(true, toPubkey, peerRef);
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await ManualSignaling._waitForIce(pc);
+
+    SignalServer._pendingPCs.set(toPubkey, { pc, peerRef });
+
+    if (SignalServer.ws?.readyState === WebSocket.OPEN) {
+      SignalServer.ws.send(JSON.stringify({
+        type: 'signal',
+        to: toPubkey,
+        payload: {
+          type: 'offer',
+          sdp: pc.localDescription.sdp,
+          name: Identity.current.name
+        }
+      }));
+    }
+  },
+
+  /** Mottag WebRTC offer, skapa answer och skicka tillbaka via signalservern */
+  async _handleOffer(fromPubkey, payload) {
+    const peerRef = { pubkey: fromPubkey, name: payload.name };
+    Peers.connections.set(fromPubkey, { name: payload.name, _pendingOffer: true });
+
+    const pc = ManualSignaling._makePC(false, fromPubkey, peerRef);
+    await pc.setRemoteDescription({ type: 'offer', sdp: payload.sdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await ManualSignaling._waitForIce(pc);
+
+    await Peers.add({ pubkey: fromPubkey, name: payload.name });
+    Network.addNode(fromPubkey, payload.name);
+    UI.renderPeers();
+
+    if (SignalServer.ws?.readyState === WebSocket.OPEN) {
+      SignalServer.ws.send(JSON.stringify({
+        type: 'signal',
+        to: fromPubkey,
+        payload: {
+          type: 'answer',
+          sdp: pc.localDescription.sdp,
+          name: Identity.current.name
+        }
+      }));
+    }
+  },
+
+  /** Mottag WebRTC answer och fullständiga kopplingen */
+  async _handleAnswer(fromPubkey, payload) {
+    const pending = SignalServer._pendingPCs.get(fromPubkey);
+    if (!pending) return;
+    SignalServer._pendingPCs.delete(fromPubkey);
+
+    pending.peerRef.name = payload.name;
+    await pending.pc.setRemoteDescription({ type: 'answer', sdp: payload.sdp });
+    await Peers.add({ pubkey: fromPubkey, name: payload.name });
+    Network.addNode(fromPubkey, payload.name);
+    UI.renderPeers();
+  }
+};
+
+// ══════════════════════════════════════════════════════════
+// 8. GOSSIP-PROTOKOLL
 // ══════════════════════════════════════════════════════════
 const Gossip = {
   active: true,
@@ -1190,6 +1382,24 @@ const UI = {
     if (label) label.textContent = online ? `Online · ${Peers.onlineCount()} peers` : 'Offline';
   },
 
+  updateSignalStatus(state) {
+    const el = document.getElementById('signal-status');
+    const btnOn = document.getElementById('btn-signal-connect');
+    const btnOff = document.getElementById('btn-signal-disconnect');
+    if (!el) return;
+    if (state === 'connected') {
+      el.textContent = `✓ Ansluten  ·  rum: ${SignalServer.room}`;
+      el.style.color = 'var(--accent)';
+      if (btnOn) btnOn.style.display = 'none';
+      if (btnOff) btnOff.style.display = '';
+    } else {
+      el.textContent = 'Ej ansluten';
+      el.style.color = '';
+      if (btnOn) btnOn.style.display = '';
+      if (btnOff) btnOff.style.display = 'none';
+    }
+  },
+
   updateHeaderCompose() {
     if (!Identity.current) return;
     const av = document.getElementById('compose-avatar');
@@ -1401,6 +1611,22 @@ async function init() {
   document.getElementById('btn-copy-answer')?.addEventListener('click', () => {
     const code = document.getElementById('answer-output-code')?.textContent;
     if (code) navigator.clipboard?.writeText(code).then(() => UI.toast('📋 Kopierat!', 'success'));
+  });
+
+  // Signalserver — anslut
+  document.getElementById('btn-signal-connect')?.addEventListener('click', (e) => {
+    const url = document.getElementById('signal-server-url')?.value.trim();
+    const room = document.getElementById('signal-room')?.value.trim();
+    if (!url) { UI.toast('Ange en server-URL', 'error'); return; }
+    if (!room) { UI.toast('Ange ett rum', 'error'); return; }
+    e.target.disabled = true;
+    SignalServer.connect(url, room);
+  });
+
+  // Signalserver — koppla från
+  document.getElementById('btn-signal-disconnect')?.addEventListener('click', () => {
+    SignalServer.disconnect();
+    UI.toast('⏏ Kopplade från signalservern', 'info');
   });
 
   // Identity

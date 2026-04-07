@@ -6,6 +6,7 @@
   <meta name="theme-color" content="#0a0a0f" />
   <title>Skrivpunkten — Decentraliserat Socialt Nätverk</title>
   <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230a0a0f' rx='6'/><text y='26' x='16' text-anchor='middle' font-size='22'>🖋️</text></svg>" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet" />
   <style>
@@ -673,6 +674,31 @@
 
   <!-- ═══ PEERS ═══ -->
   <div id="screen-peers" class="screen">
+
+    <!-- Signalserver — automatisk parning -->
+    <div class="card highlight" style="margin-bottom:16px;">
+      <div class="section-title">🔌 Signalserver — automatisk parning</div>
+      <p class="text-muted" style="font-size:12px;margin-bottom:10px;">
+        Anslut till en signalserver och ange ett rum för att automatiskt parning med andra enheter.
+        Servern används <em>bara</em> för att byta WebRTC-nycklar — all data skickas sedan direkta P2P.
+      </p>
+      <div class="form-group">
+        <label class="form-label">Server-URL</label>
+        <input type="text" id="signal-server-url" placeholder="ws://localhost:8080" value="ws://localhost:8080" />
+      </div>
+      <div class="form-group" style="margin-top:8px;">
+        <label class="form-label">Rum / Kanal</label>
+        <input type="text" id="signal-room" placeholder="t.ex. mycel-default" value="mycel-default" />
+      </div>
+      <div class="flex gap-8 mt-8 items-center" style="flex-wrap:wrap;">
+        <button class="btn btn-primary btn-sm" id="btn-signal-connect">🔌 Anslut</button>
+        <button class="btn btn-ghost btn-sm" id="btn-signal-disconnect" style="display:none;">⏏ Koppla från</button>
+        <span class="text-muted" id="signal-status" style="font-size:11px;">Ej ansluten</span>
+      </div>
+      <p class="text-muted" style="font-size:10px;margin-top:8px;">
+        Starta servern lokalt: <code>node server.js</code>
+      </p>
+    </div>
 
     <!-- Steg 1: Skapa inbjudan -->
     <div class="card highlight">
