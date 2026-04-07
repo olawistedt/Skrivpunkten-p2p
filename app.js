@@ -1284,188 +1284,162 @@ const SW = {
 // ══════════════════════════════════════════════════════════
 // 11. MQTT-SIGNALING (automatisk återanslutning, cross-browser, ingen server)
 // ══════════════════════════════════════════════════════════
-// Använder gratis publik MQTT-broker (EMQX) via WebSocket.
-// Ingen server att hosta — WebRTC-anslutningen är fortfarande ren P2P.
+// Enkel och robust: varje klient prenumererar på sin egen inbox-topic
+// och skickar periodiska "beacon"-meddelanden till kända peers.
+// Ingen beroende på retained messages (opålitligt på publika brokers).
 //
-// Ämnesstruktur:
-//   mycel/peer/{pubkey}/online     — närvaro (retained + LWT)
-//   mycel/offer/{responderPubkey}  — offer från initiator (retained)
-//   mycel/answer/{initiatorPubkey} — svar från responder (retained)
-//
-// Prenumerationsordning är avgörande:
-//   1. Rensa eventuellt kvarlämnat retained answer (från förra sessionen)
-//   2. Prenumerera på inkommande offer + peer-närvaro
-//   3. Skapa färska offer och fyll _pending (in-memory, tömt vid sidladdning)
-//   4. Prenumerera på answer EFTER att _pending är ifyllt
-//      → garanterar att alla svar som broker levererar matchar aktuell _pending
-//   5. Annonsera online-närvaro (retained)
+// Flöde:
+//   1. Varje klient prenumererar på  mycel/inbox/{myPubkey}
+//   2. Var 10:e sekund: skicka beacon till alla kända, ej anslutna peers
+//   3. När initiator (lägre pubkey) tar emot beacon → skapar och skickar offer
+//   4. Responder tar emot offer → skapar och skickar answer
+//   5. Initiator tar emot answer → WebRTC-kanal öppnas
+//   Beacons slutar skickas till en peer när kanalen är öppen.
 const MqttSignaling = {
   client: null,
   BROKER: 'wss://broker.emqx.io:8084/mqtt',
-  OFFER_TTL: 60 * 60 * 1000, // 1 h
+  _beaconTimer: null,
+  _lastOfferTo: new Map(), // peerPk → timestamp (undvik offer-spam)
 
-  async connect() {
+  connect() {
     if (!Identity.current) return;
     if (typeof mqtt === 'undefined') {
-      console.warn('mqtt.js saknas — automatisk signalering ej tillgänglig');
+      console.warn('[MQTT] mqtt.js ej laddat — automatisk signalering inaktiv');
       return;
     }
     if (MqttSignaling.client?.connected) return;
 
     const myPk = Identity.current.pubkey;
     const clientId = `mycel-${myPk.slice(0, 16)}-${Date.now()}`;
-    const myOnlineTopic = `mycel/peer/${myPk}/online`;
+    console.log('[MQTT] Ansluter till broker…');
 
     const client = mqtt.connect(MqttSignaling.BROKER, {
       clientId,
       clean: true,
       reconnectPeriod: 5000,
-      connectTimeout: 10000,
-      will: { topic: myOnlineTopic, payload: '', retain: true, qos: 1 }
+      connectTimeout: 15000,
     });
     MqttSignaling.client = client;
 
-    client.on('connect', async () => {
-      // Steg 1: Rensa kvarlämnat retained answer från förra sessionen.
-      // Detta måste göras INNAN vi prenumererar på answer-ämnet, annars riskerar
-      // vi att ta emot ett gammalt svar som inte matchar vår tomma _pending.
-      client.publish(`mycel/answer/${myPk}`, '', { retain: true, qos: 1 });
-
-      const peers = await Peers.getAll();
-
-      // Steg 2: Prenumerera på offer och peer-närvaro (inte answer ännu)
-      const step2Topics = [
-        `mycel/offer/${myPk}`,
-        ...peers.map(p => `mycel/peer/${p.pubkey}/online`)
-      ];
-
-      client.subscribe(step2Topics, async () => {
-        // Steg 3: Skapa offer för alla ej anslutna peers och fyll _pending
-        await MqttSignaling._offerToDisconnectedPeers();
-
-        // Steg 4: Prenumerera på answer — nu är _pending garanterat ifyllt.
-        // Brokern levererar retained answer direkt vid subscribe → matchar _pending.
-        client.subscribe(`mycel/answer/${myPk}`, () => {
-          // Steg 5: Annonsera närvaro (retained)
-          client.publish(
-            myOnlineTopic,
-            JSON.stringify({ pk: myPk, ts: Date.now() }),
-            { retain: true, qos: 1 }
-          );
-        });
+    client.on('connect', () => {
+      console.log('[MQTT] Ansluten till broker');
+      client.subscribe(`mycel/inbox/${myPk}`, (err) => {
+        if (err) { console.warn('[MQTT] Prenumerationsfel:', err.message); return; }
+        console.log('[MQTT] Lyssnar på mycel/inbox/' + myPk.slice(0, 12) + '…');
+        // Skicka beacon direkt vid anslutning
+        MqttSignaling._sendBeacons();
       });
+      // Periodisk beacon var 10:e sekund
+      clearInterval(MqttSignaling._beaconTimer);
+      MqttSignaling._beaconTimer = setInterval(() => MqttSignaling._sendBeacons(), 10000);
     });
 
-    client.on('message', async (topic, payload) => {
+    client.on('message', async (_topic, payload) => {
       const raw = payload.toString();
-
-      // ── Peer-närvaro ──
-      const onlineMatch = topic.match(/^mycel\/peer\/([^/]+)\/online$/);
-      if (onlineMatch) {
-        const peerPk = onlineMatch[1];
-        if (peerPk === myPk || !raw) return;
-        // Peer gick online — om jag är initiator och ej ansluten: skicka offer.
-        // Svar levereras via mycel/answer/${myPk} som vi prenumererar på.
-        if (myPk < peerPk) {
-          const conn = Peers.connections.get(peerPk);
-          if (conn?.channel?.readyState !== 'open') {
-            await MqttSignaling._sendOfferTo(peerPk);
-          }
-        }
-        return;
-      }
-
-      if (!raw) return; // retained rensning
+      if (!raw) return;
       let msg; try { msg = JSON.parse(raw); } catch { return; }
       if (!msg?.from || msg.from === myPk) return;
-      if (msg.ts && Date.now() - msg.ts > MqttSignaling.OFFER_TTL) {
-        client.publish(topic, '', { retain: true, qos: 1 });
-        return;
-      }
 
-      if (topic === `mycel/offer/${myPk}`) {
+      console.log('[MQTT] ← %s från %s', msg.type, msg.from.slice(0, 12));
+
+      if (msg.type === 'beacon') {
+        // Peer är online — om jag är initiator och ej ansluten: skicka offer
+        const conn = Peers.connections.get(msg.from);
+        if (conn?.channel?.readyState === 'open') return;
+        if (myPk < msg.from) {
+          await MqttSignaling._sendOfferTo(msg.from);
+        }
+
+      } else if (msg.type === 'offer') {
         // Jag är responder
         const conn = Peers.connections.get(msg.from);
-        if (conn?.channel?.readyState === 'open') {
-          client.publish(topic, '', { retain: true });
-          return;
-        }
+        if (conn?.channel?.readyState === 'open') return;
         try {
           const answerCode = await ManualSignaling.acceptOffer(msg.code);
-          client.publish(topic, '', { retain: true });
-          client.publish(
-            `mycel/answer/${msg.from}`,
-            JSON.stringify({ type: 'answer', from: myPk, code: answerCode, ts: Date.now() }),
-            { retain: true, qos: 1 }
-          );
-        } catch (err) { console.warn('MQTT offer-fel:', err.message); }
+          client.publish(`mycel/inbox/${msg.from}`, JSON.stringify({
+            type: 'answer', from: myPk, code: answerCode
+          }));
+          console.log('[MQTT] → answer till %s', msg.from.slice(0, 12));
+        } catch (err) {
+          console.warn('[MQTT] Offer-fel:', err.message);
+        }
 
-      } else if (topic === `mycel/answer/${myPk}`) {
+      } else if (msg.type === 'answer') {
         // Jag är initiator
         const conn = Peers.connections.get(msg.from);
-        if (conn?.channel?.readyState === 'open') {
-          client.publish(topic, '', { retain: true });
-          return;
-        }
-        client.publish(topic, '', { retain: true });
+        if (conn?.channel?.readyState === 'open') return;
         try {
           await ManualSignaling.acceptAnswer(msg.code);
+          console.log('[MQTT] Svar godkänt från %s — WebRTC öppnas', msg.from.slice(0, 12));
         } catch (err) {
-          // tempId saknas i _pending — kan inte hända med ny prenumerationsordning,
-          // men om det ändå sker: skicka nytt offer.
-          console.warn('MQTT answer-miss, skapar nytt offer:', err.message);
-          await MqttSignaling._sendOfferTo(msg.from);
+          console.warn('[MQTT] Answer-fel:', err.message);
+          // tempId saknas — skicka nytt offer nästa beacon-cykel
+          MqttSignaling._lastOfferTo.delete(msg.from);
         }
       }
     });
 
-    client.on('error', err => console.warn('MQTT-fel:', err.message));
+    client.on('close', () => {
+      console.log('[MQTT] Frånkopplad — försöker återansluta…');
+      clearInterval(MqttSignaling._beaconTimer);
+    });
+
+    client.on('error', err => console.warn('[MQTT] Fel:', err.message));
   },
 
-  subscribeToPeer(peerPubkey) {
-    if (!MqttSignaling.client?.connected) return;
-    MqttSignaling.client.subscribe(`mycel/peer/${peerPubkey}/online`);
-    // Trigger offer om vi är initiator
-    const myPk = Identity.current?.pubkey;
-    if (myPk && myPk < peerPubkey) MqttSignaling._sendOfferTo(peerPubkey);
-  },
-
-  async _offerToDisconnectedPeers() {
+  async _sendBeacons() {
     if (!MqttSignaling.client?.connected || !Identity.current) return;
+    const myPk = Identity.current.pubkey;
     const peers = await Peers.getAll();
+    let sent = 0;
     for (const peer of peers) {
-      await MqttSignaling._sendOfferTo(peer.pubkey);
+      const conn = Peers.connections.get(peer.pubkey);
+      if (conn?.channel?.readyState === 'open') continue;
+      MqttSignaling.client.publish(`mycel/inbox/${peer.pubkey}`, JSON.stringify({
+        type: 'beacon', from: myPk
+      }));
+      sent++;
     }
+    if (sent > 0) console.log('[MQTT] Beacon → %d peer(s)', sent);
+  },
+
+  subscribeToPeer(_peerPubkey) {
+    // Inget behov — vi prenumererar bara på vår egen inbox.
+    // Beacon skickas automatiskt vid nästa intervall.
   },
 
   async _sendOfferTo(peerPk) {
     if (!MqttSignaling.client?.connected || !Identity.current) return;
     const myPk = Identity.current.pubkey;
-    if (myPk >= peerPk) return;
+    if (myPk >= peerPk) return; // bara initiator (lägre pubkey)
     const conn = Peers.connections.get(peerPk);
     if (conn?.channel?.readyState === 'open') return;
+    // Undvik offer-spam: max en gång per 30 s per peer
+    const last = MqttSignaling._lastOfferTo.get(peerPk) || 0;
+    if (Date.now() - last < 30000) return;
+    MqttSignaling._lastOfferTo.set(peerPk, Date.now());
     try {
+      console.log('[MQTT] Skapar offer till %s…', peerPk.slice(0, 12));
       const { code } = await ManualSignaling.createOffer();
-      MqttSignaling.client.publish(
-        `mycel/offer/${peerPk}`,
-        JSON.stringify({ type: 'offer', from: myPk, code, ts: Date.now() }),
-        { retain: true, qos: 1 }
-      );
+      MqttSignaling.client.publish(`mycel/inbox/${peerPk}`, JSON.stringify({
+        type: 'offer', from: myPk, code
+      }));
+      console.log('[MQTT] → offer till %s', peerPk.slice(0, 12));
       const peers = await Peers.getAll();
       const peer = peers.find(p => p.pubkey === peerPk);
       if (peer) ManualSignaling._rcCodes.set(peerPk, { name: peer.name, code });
       UI.renderPeers();
-    } catch { }
+    } catch (err) {
+      console.warn('[MQTT] Offer-skapningsfel:', err.message);
+    }
   },
 
   sendOffer(toPubkey, code) {
     if (!MqttSignaling.client?.connected || !Identity.current) return false;
     try {
-      MqttSignaling.client.publish(
-        `mycel/offer/${toPubkey}`,
-        JSON.stringify({ type: 'offer', from: Identity.current.pubkey, code, ts: Date.now() }),
-        { retain: true, qos: 1 }
-      );
+      MqttSignaling.client.publish(`mycel/inbox/${toPubkey}`, JSON.stringify({
+        type: 'offer', from: Identity.current.pubkey, code
+      }));
       return true;
     } catch { return false; }
   }
