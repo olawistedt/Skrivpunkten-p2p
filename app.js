@@ -585,11 +585,17 @@ const ManualSignaling = {
       pc.ondatachannel = (e) => setupChannel(e.channel);
     }
 
+    // Rensa kanal vid frånkoppling — reagera på 'disconnected' direkt (snabbt, ~5 s)
+    // så att _sendBeacons slutar hoppa över peern och återanslutning kan starta.
+    const _clearChannel = () => {
+      const entry = Peers.connections.get(peerRef.pubkey);
+      if (entry?.channel) { entry.channel = null; UI.renderPeers(); }
+    };
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-        const entry = Peers.connections.get(peerRef.pubkey);
-        if (entry) { entry.channel = null; UI.renderPeers(); }
-      }
+      if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) _clearChannel();
+    };
+    pc.oniceconnectionstatechange = () => {
+      if (['disconnected', 'failed', 'closed'].includes(pc.iceConnectionState)) _clearChannel();
     };
 
     return pc;
@@ -1343,17 +1349,15 @@ const MqttSignaling = {
       console.log('[MQTT] ← %s från %s', msg.type, msg.from.slice(0, 12));
 
       if (msg.type === 'beacon') {
-        // Peer är online — om jag är initiator och ej ansluten: skicka offer
-        const conn = Peers.connections.get(msg.from);
-        if (conn?.channel?.readyState === 'open') return;
+        // Peer är online — om jag är initiator: skicka offer.
+        // Ingen readyState-check här; _sendOfferTo har egen throttle + öppen-check.
         if (myPk < msg.from) {
           await MqttSignaling._sendOfferTo(msg.from);
         }
 
       } else if (msg.type === 'offer') {
-        // Jag är responder
-        const conn = Peers.connections.get(msg.from);
-        if (conn?.channel?.readyState === 'open') return;
+        // Jag är responder — acceptera alltid offer (peer kan ha startat om).
+        // Ingen readyState-check: gammal kanal kan vara 'open' pga försenad ICE-detektering.
         try {
           const answerCode = await ManualSignaling.acceptOffer(msg.code);
           client.publish(`mycel/inbox/${msg.from}`, JSON.stringify({
