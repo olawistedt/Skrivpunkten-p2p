@@ -1284,10 +1284,18 @@ const SW = {
 // ══════════════════════════════════════════════════════════
 // Använder gratis publik MQTT-broker (EMQX) via WebSocket.
 // Ingen server att hosta — WebRTC-anslutningen är fortfarande ren P2P.
-// Signalering: offer/answer publiceras på ämnet  mycel/signal/{pubkey}
+//
+// Ämnesstruktur:
+//   mycel/offer/{responderPubkey}  — offer från initiator till responder (retained)
+//   mycel/answer/{initiatorPubkey} — svar från responder till initiator (retained)
+//
+// Retained messages är avgörande: brokern sparar senaste meddelanden och
+// levererar dem direkt till nya prenumeranter — löser alla timing-problem
+// vid page reload.
 const MqttSignaling = {
   client: null,
   BROKER: 'wss://broker.emqx.io:8084/mqtt',
+  TTL: 5 * 60 * 1000, // ignorera meddelanden äldre än 5 min
 
   connect() {
     if (!Identity.current) return;
@@ -1309,31 +1317,62 @@ const MqttSignaling = {
     MqttSignaling.client = client;
 
     client.on('connect', () => {
-      client.subscribe(`mycel/signal/${myPk}`, (err) => {
-        if (!err) MqttSignaling._offerToDisconnectedPeers();
+      // Prenumerera på BÅDA ämnena innan vi skickar offer,
+      // annars kan vi missa svaret om det returnerar snabbt.
+      client.subscribe([
+        `mycel/offer/${myPk}`,
+        `mycel/answer/${myPk}`
+      ], () => {
+        MqttSignaling._offerToDisconnectedPeers();
       });
     });
 
     client.on('message', async (topic, payload) => {
-      let msg;
-      try { msg = JSON.parse(payload.toString()); } catch { return; }
-      if (!msg.from || msg.from === myPk) return;
+      const raw = payload.toString();
+      if (!raw) return; // tom payload = rensning av retained, ignorera
 
-      if (msg.type === 'offer') {
+      let msg;
+      try { msg = JSON.parse(raw); } catch { return; }
+      if (!msg?.from || msg.from === myPk) return;
+
+      // Ignorera och rensa inaktuella meddelanden
+      if (msg.ts && Date.now() - msg.ts > MqttSignaling.TTL) {
+        client.publish(topic, '', { retain: true });
+        return;
+      }
+
+      if (topic === `mycel/offer/${myPk}`) {
+        // Jag är responder — tog emot ett offer
+        const conn = Peers.connections.get(msg.from);
+        if (conn?.channel?.readyState === 'open') {
+          client.publish(topic, '', { retain: true }); // rensa — redan ansluten
+          return;
+        }
         try {
           const answerCode = await ManualSignaling.acceptOffer(msg.code);
+          client.publish(topic, '', { retain: true }); // rensa offer efter bruk
           client.publish(
-            `mycel/signal/${msg.from}`,
-            JSON.stringify({ type: 'answer', from: myPk, code: answerCode })
+            `mycel/answer/${msg.from}`,
+            JSON.stringify({ type: 'answer', from: myPk, code: answerCode, ts: Date.now() }),
+            { retain: true }
           );
         } catch (err) {
           console.warn('MQTT offer-fel:', err.message);
         }
-      } else if (msg.type === 'answer') {
+
+      } else if (topic === `mycel/answer/${myPk}`) {
+        // Jag är initiator — tog emot ett svar
+        const conn = Peers.connections.get(msg.from);
+        if (conn?.channel?.readyState === 'open') {
+          client.publish(topic, '', { retain: true }); // rensa — redan ansluten
+          return;
+        }
+        client.publish(topic, '', { retain: true }); // rensa svar direkt
         try {
           await ManualSignaling.acceptAnswer(msg.code);
-        } catch (err) {
-          console.warn('MQTT answer-fel:', err.message);
+        } catch {
+          // _pending saknar detta offer (t.ex. efter page reload) — skicka nytt offer
+          await MqttSignaling._sendOfferToPeer(msg.from);
         }
       }
     });
@@ -1343,34 +1382,44 @@ const MqttSignaling = {
     });
   },
 
-  async _offerToDisconnectedPeers() {
+  // Skicka offer till en specifik peer (bara om jag är initiator)
+  async _sendOfferToPeer(peerPubkey) {
     if (!MqttSignaling.client?.connected || !Identity.current) return;
     const myPk = Identity.current.pubkey;
+    if (myPk >= peerPubkey) return; // bara initiatorn (lägre pubkey) skickar offer
+    const conn = Peers.connections.get(peerPubkey);
+    if (conn?.channel?.readyState === 'open') return;
+    try {
+      const { code } = await ManualSignaling.createOffer();
+      MqttSignaling.client.publish(
+        `mycel/offer/${peerPubkey}`,
+        JSON.stringify({ type: 'offer', from: myPk, code, ts: Date.now() }),
+        { retain: true }
+      );
+      const peers = await Peers.getAll();
+      const peer = peers.find(p => p.pubkey === peerPubkey);
+      if (peer) ManualSignaling._rcCodes.set(peerPubkey, { name: peer.name, code });
+      UI.renderPeers();
+    } catch { }
+  },
+
+  async _offerToDisconnectedPeers() {
+    if (!MqttSignaling.client?.connected || !Identity.current) return;
     const peers = await Peers.getAll();
     for (const peer of peers) {
       const conn = Peers.connections.get(peer.pubkey);
       if (conn?.channel?.readyState === 'open') continue;
-      // Bokstavsordning avgör vem som initierar (undviker dubbeloffer)
-      if (myPk < peer.pubkey) {
-        try {
-          const { code } = await ManualSignaling.createOffer();
-          MqttSignaling.client.publish(
-            `mycel/signal/${peer.pubkey}`,
-            JSON.stringify({ type: 'offer', from: myPk, code })
-          );
-          ManualSignaling._rcCodes.set(peer.pubkey, { name: peer.name, code });
-        } catch { }
-      }
+      await MqttSignaling._sendOfferToPeer(peer.pubkey);
     }
-    UI.renderPeers();
   },
 
   sendOffer(toPubkey, code) {
     if (!MqttSignaling.client?.connected || !Identity.current) return false;
     try {
       MqttSignaling.client.publish(
-        `mycel/signal/${toPubkey}`,
-        JSON.stringify({ type: 'offer', from: Identity.current.pubkey, code })
+        `mycel/offer/${toPubkey}`,
+        JSON.stringify({ type: 'offer', from: Identity.current.pubkey, code, ts: Date.now() }),
+        { retain: true }
       );
       return true;
     } catch { return false; }
