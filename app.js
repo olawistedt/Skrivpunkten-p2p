@@ -661,6 +661,7 @@ const ManualSignaling = {
 
     await Peers.add({ pubkey: peerPubkey, name });
     Network.addNode(peerPubkey, name);
+    MqttSignaling.subscribeToPeer(peerPubkey);
     UI.renderPeers();
 
     return btoa(JSON.stringify({
@@ -704,6 +705,7 @@ const ManualSignaling = {
     await pending.pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
     await Peers.add({ pubkey: data.pk, name: data.n });
     Network.addNode(data.pk, data.n);
+    MqttSignaling.subscribeToPeer(data.pk);
     UI.renderPeers();
   },
 
@@ -1286,18 +1288,23 @@ const SW = {
 // Ingen server att hosta — WebRTC-anslutningen är fortfarande ren P2P.
 //
 // Ämnesstruktur:
-//   mycel/offer/{responderPubkey}  — offer från initiator till responder (retained)
-//   mycel/answer/{initiatorPubkey} — svar från responder till initiator (retained)
+//   mycel/peer/{pubkey}/online     — närvaro (retained + LWT) — TRIGGAR återanslutning
+//   mycel/offer/{responderPubkey}  — offer från initiator (retained)
+//   mycel/answer/{initiatorPubkey} — svar från responder (retained)
 //
-// Retained messages är avgörande: brokern sparar senaste meddelanden och
-// levererar dem direkt till nya prenumeranter — löser alla timing-problem
-// vid page reload.
+// Flöde:
+//   1. Vid uppstart: prenumerera på peers' online-ämnen + egna offer/answer-ämnen
+//   2. Publicera eget online-meddelande (retained) — peers som prenumererar ser det direkt
+//   3. När en känd peer går online och jag är initiator (lägre pubkey) → skicka offer
+//   4. Respondern tar emot offer → skickar answer
+//   5. Initiatorn tar emot answer → WebRTC-kanal öppnas
+//   LWT (Last Will): brokern rensar online-meddelandet automatiskt vid oväntat frånkoppling
 const MqttSignaling = {
   client: null,
   BROKER: 'wss://broker.emqx.io:8084/mqtt',
-  TTL: 5 * 60 * 1000, // ignorera meddelanden äldre än 5 min
+  TTL: 10 * 60 * 1000, // ignorera meddelanden äldre än 10 min
 
-  connect() {
+  async connect() {
     if (!Identity.current) return;
     if (typeof mqtt === 'undefined') {
       console.warn('mqtt.js saknas — automatisk signalering ej tillgänglig');
@@ -1307,45 +1314,70 @@ const MqttSignaling = {
 
     const myPk = Identity.current.pubkey;
     const clientId = `mycel-${myPk.slice(0, 16)}-${Date.now()}`;
+    const myOnlineTopic = `mycel/peer/${myPk}/online`;
 
     const client = mqtt.connect(MqttSignaling.BROKER, {
       clientId,
       clean: true,
       reconnectPeriod: 5000,
       connectTimeout: 10000,
+      // LWT: brokern raderar mitt online-meddelande om jag kopplas från oväntat
+      will: { topic: myOnlineTopic, payload: '', retain: true, qos: 1 }
     });
     MqttSignaling.client = client;
 
-    client.on('connect', () => {
-      // Prenumerera på BÅDA ämnena innan vi skickar offer,
-      // annars kan vi missa svaret om det returnerar snabbt.
-      client.subscribe([
-        `mycel/offer/${myPk}`,
-        `mycel/answer/${myPk}`
-      ], () => {
-        MqttSignaling._offerToDisconnectedPeers();
+    client.on('connect', async () => {
+      const peers = await Peers.getAll();
+      const topics = [
+        `mycel/offer/${myPk}`,           // inkommande offer (jag är responder)
+        `mycel/answer/${myPk}`,          // inkommande svar (jag är initiator)
+        ...peers.map(p => `mycel/peer/${p.pubkey}/online`) // peers' närvaro
+      ];
+      client.subscribe(topics, () => {
+        // Annonsera att jag är online — retained, så att peers ser mig direkt vid uppstart
+        client.publish(
+          myOnlineTopic,
+          JSON.stringify({ pk: myPk, ts: Date.now() }),
+          { retain: true, qos: 1 }
+        );
       });
     });
 
     client.on('message', async (topic, payload) => {
       const raw = payload.toString();
-      if (!raw) return; // tom payload = rensning av retained, ignorera
 
-      let msg;
-      try { msg = JSON.parse(raw); } catch { return; }
+      // ── Närvaro: peer gick online eller offline ──
+      const onlineMatch = topic.match(/^mycel\/peer\/([^/]+)\/online$/);
+      if (onlineMatch) {
+        const peerPk = onlineMatch[1];
+        if (peerPk === myPk) return;
+        if (!raw) return; // LWT / rensning — peer gick offline, inget att göra
+        let msg; try { msg = JSON.parse(raw); } catch { return; }
+        if (msg.ts && Date.now() - msg.ts > MqttSignaling.TTL) return;
+        // Om jag är initiator och inte ansluten — skicka offer nu
+        if (myPk < peerPk) {
+          const conn = Peers.connections.get(peerPk);
+          if (conn?.channel?.readyState !== 'open') {
+            await MqttSignaling._sendOfferTo(peerPk);
+          }
+        }
+        return;
+      }
+
+      // ── Offer/answer ──
+      if (!raw) return; // rensning av retained, ignorera
+      let msg; try { msg = JSON.parse(raw); } catch { return; }
       if (!msg?.from || msg.from === myPk) return;
-
-      // Ignorera och rensa inaktuella meddelanden
       if (msg.ts && Date.now() - msg.ts > MqttSignaling.TTL) {
-        client.publish(topic, '', { retain: true });
+        client.publish(topic, '', { retain: true }); // rensa inaktuellt
         return;
       }
 
       if (topic === `mycel/offer/${myPk}`) {
-        // Jag är responder — tog emot ett offer
+        // Jag är responder
         const conn = Peers.connections.get(msg.from);
         if (conn?.channel?.readyState === 'open') {
-          client.publish(topic, '', { retain: true }); // rensa — redan ansluten
+          client.publish(topic, '', { retain: true });
           return;
         }
         try {
@@ -1354,63 +1386,54 @@ const MqttSignaling = {
           client.publish(
             `mycel/answer/${msg.from}`,
             JSON.stringify({ type: 'answer', from: myPk, code: answerCode, ts: Date.now() }),
-            { retain: true }
+            { retain: true, qos: 1 }
           );
-        } catch (err) {
-          console.warn('MQTT offer-fel:', err.message);
-        }
+        } catch (err) { console.warn('MQTT offer-fel:', err.message); }
 
       } else if (topic === `mycel/answer/${myPk}`) {
-        // Jag är initiator — tog emot ett svar
+        // Jag är initiator
         const conn = Peers.connections.get(msg.from);
         if (conn?.channel?.readyState === 'open') {
-          client.publish(topic, '', { retain: true }); // rensa — redan ansluten
+          client.publish(topic, '', { retain: true });
           return;
         }
-        client.publish(topic, '', { retain: true }); // rensa svar direkt
+        client.publish(topic, '', { retain: true }); // rensa direkt
         try {
           await ManualSignaling.acceptAnswer(msg.code);
         } catch {
-          // _pending saknar detta offer (t.ex. efter page reload) — skicka nytt offer
-          await MqttSignaling._sendOfferToPeer(msg.from);
+          // _pending saknas (t.ex. efter page reload) — skicka nytt offer
+          await MqttSignaling._sendOfferTo(msg.from);
         }
       }
     });
 
-    client.on('error', (err) => {
-      console.warn('MQTT-fel:', err.message);
-    });
+    client.on('error', err => console.warn('MQTT-fel:', err.message));
   },
 
-  // Skicka offer till en specifik peer (bara om jag är initiator)
-  async _sendOfferToPeer(peerPubkey) {
+  // Prenumerera på en nyligen tillagd peers närvaro (kallas när peer läggs till manuellt)
+  subscribeToPeer(peerPubkey) {
+    if (!MqttSignaling.client?.connected) return;
+    MqttSignaling.client.subscribe(`mycel/peer/${peerPubkey}/online`);
+  },
+
+  async _sendOfferTo(peerPk) {
     if (!MqttSignaling.client?.connected || !Identity.current) return;
     const myPk = Identity.current.pubkey;
-    if (myPk >= peerPubkey) return; // bara initiatorn (lägre pubkey) skickar offer
-    const conn = Peers.connections.get(peerPubkey);
+    if (myPk >= peerPk) return; // bara initiator (lägre pubkey) skickar offer
+    const conn = Peers.connections.get(peerPk);
     if (conn?.channel?.readyState === 'open') return;
     try {
       const { code } = await ManualSignaling.createOffer();
       MqttSignaling.client.publish(
-        `mycel/offer/${peerPubkey}`,
+        `mycel/offer/${peerPk}`,
         JSON.stringify({ type: 'offer', from: myPk, code, ts: Date.now() }),
-        { retain: true }
+        { retain: true, qos: 1 }
       );
       const peers = await Peers.getAll();
-      const peer = peers.find(p => p.pubkey === peerPubkey);
-      if (peer) ManualSignaling._rcCodes.set(peerPubkey, { name: peer.name, code });
+      const peer = peers.find(p => p.pubkey === peerPk);
+      if (peer) ManualSignaling._rcCodes.set(peerPk, { name: peer.name, code });
       UI.renderPeers();
     } catch { }
-  },
-
-  async _offerToDisconnectedPeers() {
-    if (!MqttSignaling.client?.connected || !Identity.current) return;
-    const peers = await Peers.getAll();
-    for (const peer of peers) {
-      const conn = Peers.connections.get(peer.pubkey);
-      if (conn?.channel?.readyState === 'open') continue;
-      await MqttSignaling._sendOfferToPeer(peer.pubkey);
-    }
   },
 
   sendOffer(toPubkey, code) {
@@ -1419,7 +1442,7 @@ const MqttSignaling = {
       MqttSignaling.client.publish(
         `mycel/offer/${toPubkey}`,
         JSON.stringify({ type: 'offer', from: Identity.current.pubkey, code, ts: Date.now() }),
-        { retain: true }
+        { retain: true, qos: 1 }
       );
       return true;
     } catch { return false; }
