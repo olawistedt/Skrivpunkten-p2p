@@ -497,6 +497,17 @@ const ManualSignaling = {
         entry.lastSeen = Date.now();
         Peers.connections.set(pubkey, entry);
         if (connKey !== pubkey) Peers.connections.delete(connKey);
+
+        // Spara kontaktuppgifter i localStorage vid lyckad anslutning
+        try {
+          const contacts = JSON.parse(localStorage.getItem('mycel-contacts') || '[]');
+          const idx = contacts.findIndex(c => c.pubkey === pubkey);
+          const record = { pubkey, name: peerRef.name, lastConnected: Date.now() };
+          if (idx >= 0) contacts[idx] = record;
+          else contacts.push(record);
+          localStorage.setItem('mycel-contacts', JSON.stringify(contacts));
+        } catch { }
+
         UI.updateConnectionStatus(true);
         UI.renderPeers();
         UI.updateStats();
@@ -1253,6 +1264,14 @@ async function init() {
     Gossip.init();
     Network.init();
     SW.register();
+
+    // Läs in sparade kontakter från localStorage och synka till IndexedDB
+    try {
+      const lsContacts = JSON.parse(localStorage.getItem('mycel-contacts') || '[]');
+      for (const c of lsContacts) {
+        await Peers.add({ pubkey: c.pubkey, name: c.name, lastSeen: c.lastConnected });
+      }
+    } catch { }
 
     // Automatisk återanslutning till kända peers
     Peers.getAll().then(savedPeers => ManualSignaling.autoReconnect(savedPeers));
