@@ -547,23 +547,28 @@ const ManualSignaling = {
         if (entry) entry.channel = null;
         UI.renderPeers();
         UI.updateConnectionStatus(Peers.onlineCount() > 0);
-        // Automatisk återanslutning: initiator skapar nytt offer när kanalen stängs
+        // Initiator skapar nytt offer när kanalen stängs
         if (isInitiator && pubkey) {
           setTimeout(async () => {
             const cur = Peers.connections.get(pubkey);
             if (cur?.channel?.readyState === 'open') return;
             try {
               const { code } = await ManualSignaling.createOffer();
-              const mySlice = Identity.current?.pubkey?.slice(0, 16);
-              const peerSlice = pubkey.slice(0, 16);
-              if (mySlice && peerSlice) {
-                localStorage.setItem(
-                  ManualSignaling._lsKey('o', mySlice, peerSlice),
-                  JSON.stringify({ code, ts: Date.now() })
-                );
-                ManualSignaling._rcCodes.set(pubkey, { name: peerRef.name, code });
-                UI.renderPeers();
+              // Primärt: WebSocket (cross-browser)
+              const sent = MqttSignaling.sendOffer(pubkey, code);
+              // Fallback: localStorage (samma browser, olika flikar)
+              if (!sent) {
+                const mySlice = Identity.current?.pubkey?.slice(0, 16);
+                const peerSlice = pubkey.slice(0, 16);
+                if (mySlice && peerSlice) {
+                  localStorage.setItem(
+                    ManualSignaling._lsKey('o', mySlice, peerSlice),
+                    JSON.stringify({ code, ts: Date.now() })
+                  );
+                }
               }
+              ManualSignaling._rcCodes.set(pubkey, { name: peerRef.name, code });
+              UI.renderPeers();
             } catch { }
           }, 1500);
         }
@@ -1275,6 +1280,104 @@ const SW = {
 };
 
 // ══════════════════════════════════════════════════════════
+// 11. MQTT-SIGNALING (automatisk återanslutning, cross-browser, ingen server)
+// ══════════════════════════════════════════════════════════
+// Använder gratis publik MQTT-broker (EMQX) via WebSocket.
+// Ingen server att hosta — WebRTC-anslutningen är fortfarande ren P2P.
+// Signalering: offer/answer publiceras på ämnet  mycel/signal/{pubkey}
+const MqttSignaling = {
+  client: null,
+  BROKER: 'wss://broker.emqx.io:8084/mqtt',
+
+  connect() {
+    if (!Identity.current) return;
+    if (typeof mqtt === 'undefined') {
+      console.warn('mqtt.js saknas — automatisk signalering ej tillgänglig');
+      return;
+    }
+    if (MqttSignaling.client?.connected) return;
+
+    const myPk = Identity.current.pubkey;
+    const clientId = `mycel-${myPk.slice(0, 16)}-${Date.now()}`;
+
+    const client = mqtt.connect(MqttSignaling.BROKER, {
+      clientId,
+      clean: true,
+      reconnectPeriod: 5000,
+      connectTimeout: 10000,
+    });
+    MqttSignaling.client = client;
+
+    client.on('connect', () => {
+      client.subscribe(`mycel/signal/${myPk}`, (err) => {
+        if (!err) MqttSignaling._offerToDisconnectedPeers();
+      });
+    });
+
+    client.on('message', async (topic, payload) => {
+      let msg;
+      try { msg = JSON.parse(payload.toString()); } catch { return; }
+      if (!msg.from || msg.from === myPk) return;
+
+      if (msg.type === 'offer') {
+        try {
+          const answerCode = await ManualSignaling.acceptOffer(msg.code);
+          client.publish(
+            `mycel/signal/${msg.from}`,
+            JSON.stringify({ type: 'answer', from: myPk, code: answerCode })
+          );
+        } catch (err) {
+          console.warn('MQTT offer-fel:', err.message);
+        }
+      } else if (msg.type === 'answer') {
+        try {
+          await ManualSignaling.acceptAnswer(msg.code);
+        } catch (err) {
+          console.warn('MQTT answer-fel:', err.message);
+        }
+      }
+    });
+
+    client.on('error', (err) => {
+      console.warn('MQTT-fel:', err.message);
+    });
+  },
+
+  async _offerToDisconnectedPeers() {
+    if (!MqttSignaling.client?.connected || !Identity.current) return;
+    const myPk = Identity.current.pubkey;
+    const peers = await Peers.getAll();
+    for (const peer of peers) {
+      const conn = Peers.connections.get(peer.pubkey);
+      if (conn?.channel?.readyState === 'open') continue;
+      // Bokstavsordning avgör vem som initierar (undviker dubbeloffer)
+      if (myPk < peer.pubkey) {
+        try {
+          const { code } = await ManualSignaling.createOffer();
+          MqttSignaling.client.publish(
+            `mycel/signal/${peer.pubkey}`,
+            JSON.stringify({ type: 'offer', from: myPk, code })
+          );
+          ManualSignaling._rcCodes.set(peer.pubkey, { name: peer.name, code });
+        } catch { }
+      }
+    }
+    UI.renderPeers();
+  },
+
+  sendOffer(toPubkey, code) {
+    if (!MqttSignaling.client?.connected || !Identity.current) return false;
+    try {
+      MqttSignaling.client.publish(
+        `mycel/signal/${toPubkey}`,
+        JSON.stringify({ type: 'offer', from: Identity.current.pubkey, code })
+      );
+      return true;
+    } catch { return false; }
+  }
+};
+
+// ══════════════════════════════════════════════════════════
 // HJÄLPFUNKTIONER
 // ══════════════════════════════════════════════════════════
 function escHtml(str) {
@@ -1317,6 +1420,9 @@ async function init() {
     // Automatisk återanslutning till kända peers
     Peers.getAll().then(savedPeers => ManualSignaling.autoReconnect(savedPeers));
 
+    // MQTT-signaling för cross-browser-återanslutning (ingen server krävs)
+    MqttSignaling.connect();
+
     // Rensa peer-param ur URL om den finns kvar från en gammal session
     const url = new URL(location.href);
     if (url.searchParams.has('peer')) {
@@ -1349,6 +1455,7 @@ async function init() {
       Gossip.init();
       Network.init();
       SW.register();
+      MqttSignaling.connect();
 
       // Demo-inlägg
       const welcome = await Posts.create(
