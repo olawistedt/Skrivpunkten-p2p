@@ -1976,20 +1976,7 @@ async function init() {
 
   function doLogout() {
     sessionStorage.setItem('loggedOut', '1');
-    Identity.current = null;
-    Identity.privateKey = null;
-    document.getElementById('bottom-nav').style.display = 'none';
-    document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-    const onboard = document.getElementById('screen-onboard');
-    onboard.classList.add('active');
-    // Pre-fill name so user just clicks "Logga in"
-    DB.get('identity', 'self').then(id => {
-      if (id) {
-        document.getElementById('onboard-name').value = id.name;
-        document.getElementById('onboard-bio').value = id.bio || '';
-        document.getElementById('btn-create-identity').textContent = '🔑 Logga in';
-      }
-    });
+    location.reload();
   }
 
   document.getElementById('btn-nav-logout')?.addEventListener('click', () => {
