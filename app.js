@@ -1980,7 +1980,6 @@ async function init() {
   }
 
   document.getElementById('btn-nav-logout')?.addEventListener('click', () => {
-    if (!confirm('Logga ut? Din identitet och dina inlägg finns kvar.')) return;
     doLogout();
   });
 
