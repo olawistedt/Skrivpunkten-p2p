@@ -1148,10 +1148,10 @@ const UI = {
       container.innerHTML = posts.map(p => {
         const likes = likesByPost.get(p.id) || [];
         const iLiked = likes.some(l => l.likerPubkey === myPk);
+        const hasLikes = likes.length > 0;
         const likeNames = likes.map(l => escHtml(l.likerName || l.likerPubkey.slice(0, 8))).join(', ');
-        const likeLabel = likes.length > 0
-          ? `${iLiked ? '♥' : '♡'} ${likes.length}`
-          : (iLiked ? '♥' : '♡ gilla');
+        const likeClass = iLiked ? ' liked' : (hasLikes ? ' has-likes' : '');
+        const likeLabel = hasLikes ? `♥ ${likes.length}` : '♡ gilla';
         return `
         <div class="post-card" data-id="${p.id}">
           <div class="post-header">
@@ -1166,7 +1166,7 @@ const UI = {
           </div>
           <div class="post-content">${escHtml(p.text)}</div>
           <div class="post-footer">
-            <button class="post-action-btn${iLiked ? ' liked' : ''}" onclick="UI.likePost('${p.id}')" title="${likeNames}">
+            <button class="post-action-btn${likeClass}" onclick="UI.likePost('${p.id}')" title="${likeNames}">
               ${likeLabel}
             </button>
             <button class="post-action-btn" onclick="UI.gossipPost('${p.id}')">
