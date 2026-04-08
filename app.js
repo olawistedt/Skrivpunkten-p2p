@@ -612,7 +612,7 @@ const ManualSignaling = {
         }
       };
       pc.addEventListener('icegatheringstatechange', handler);
-      setTimeout(resolve, 6000);
+      setTimeout(resolve, 3000);
     });
   },
 
@@ -1335,9 +1335,9 @@ const MqttSignaling = {
         // Skicka beacon direkt vid anslutning
         MqttSignaling._sendBeacons();
       });
-      // Periodisk beacon var 10:e sekund
+      // Periodisk beacon var 3:e sekund
       clearInterval(MqttSignaling._beaconTimer);
-      MqttSignaling._beaconTimer = setInterval(() => MqttSignaling._sendBeacons(), 10000);
+      MqttSignaling._beaconTimer = setInterval(() => MqttSignaling._sendBeacons(), 3000);
     });
 
     client.on('message', async (_topic, payload) => {
@@ -1395,16 +1395,19 @@ const MqttSignaling = {
     if (!MqttSignaling.client?.connected || !Identity.current) return;
     const myPk = Identity.current.pubkey;
     const peers = await Peers.getAll();
-    let sent = 0;
     for (const peer of peers) {
       const conn = Peers.connections.get(peer.pubkey);
       if (conn?.channel?.readyState === 'open') continue;
+      // Skicka beacon så peern vet att vi är online
       MqttSignaling.client.publish(`mycel/inbox/${peer.pubkey}`, JSON.stringify({
         type: 'beacon', from: myPk
       }));
-      sent++;
+      // Om jag är initiator: skapa offer direkt här — vänta inte reaktivt på peers beacon.
+      // Det halverar fördröjningen eftersom vi inte behöver vänta på peers beacon-intervall.
+      if (myPk < peer.pubkey) {
+        MqttSignaling._sendOfferTo(peer.pubkey);
+      }
     }
-    if (sent > 0) console.log('[MQTT] Beacon → %d peer(s)', sent);
   },
 
   subscribeToPeer(_peerPubkey) {
@@ -1418,9 +1421,9 @@ const MqttSignaling = {
     if (myPk >= peerPk) return; // bara initiator (lägre pubkey)
     const conn = Peers.connections.get(peerPk);
     if (conn?.channel?.readyState === 'open') return;
-    // Undvik offer-spam: max en gång per 30 s per peer
+    // Undvik offer-spam: max en gång per 10 s per peer
     const last = MqttSignaling._lastOfferTo.get(peerPk) || 0;
-    if (Date.now() - last < 30000) return;
+    if (Date.now() - last < 10000) return;
     MqttSignaling._lastOfferTo.set(peerPk, Date.now());
     try {
       console.log('[MQTT] Skapar offer till %s…', peerPk.slice(0, 12));
