@@ -1746,7 +1746,8 @@ function timeAgo(ts) {
 // ══════════════════════════════════════════════════════════
 async function init() {
   await DB.open();
-  const id = await Identity.load();
+  const loggedOut = sessionStorage.getItem('loggedOut');
+  const id = loggedOut ? null : await Identity.load();
 
   if (id) {
     // Befintlig användare
@@ -1782,7 +1783,14 @@ async function init() {
     }, 3000);
     UI.updateConnectionStatus(navigator.onLine);
   } else {
-    // Ny användare — visa onboarding
+    // Ny användare eller utloggad — visa onboarding
+    const existingId = await DB.get('identity', 'self');
+    if (existingId) {
+      // Returning user: pre-fill name and update button label
+      document.getElementById('onboard-name').value = existingId.name;
+      document.getElementById('onboard-bio').value = existingId.bio || '';
+      document.getElementById('btn-create-identity').textContent = '🔑 Logga in';
+    }
     document.getElementById('screen-onboard').classList.add('active');
   }
 
@@ -1796,20 +1804,37 @@ async function init() {
     const btn = document.getElementById('btn-create-identity');
     btn.disabled = true;
     try {
-      await Identity.create(name, bio);
-      UI.updateHeaderCompose();
-      UI.showMainApp();
-      Gossip.init();
-      Network.init();
-      SW.register();
-      MqttSignaling.connect();
+      const existing = await DB.get('identity', 'self');
+      if (existing && existing.name === name) {
+        // Resume existing identity — just load keys
+        sessionStorage.removeItem('loggedOut');
+        await Identity.load();
+        UI.updateHeaderCompose();
+        UI.showMainApp();
+        Gossip.init();
+        Network.init();
+        SW.register();
+        MqttSignaling.connect();
+        UI.renderFeed();
+        UI.toast('✓ Välkommen tillbaka, ' + name + '!', 'success');
+      } else {
+        // New identity
+        await Identity.create(name, bio);
+        sessionStorage.removeItem('loggedOut');
+        UI.updateHeaderCompose();
+        UI.showMainApp();
+        Gossip.init();
+        Network.init();
+        SW.register();
+        MqttSignaling.connect();
 
-      // Demo-inlägg
-      const welcome = await Posts.create(
-        `Hej världen! 🌿 Det här är mitt första inlägg på Skrivpunkten — det decentraliserade nätverket som jag äger. Inga servrar. Inga mellanhänder. Bara ren kryptografi och skvaller.`
-      );
-      UI.renderFeed();
-      UI.toast('🎉 Välkommen till Skrivpunkten!', 'success');
+        // Demo-inlägg
+        await Posts.create(
+          `Hej världen! 🌿 Det här är mitt första inlägg på Skrivpunkten — det decentraliserade nätverket som jag äger. Inga servrar. Inga mellanhänder. Bara ren kryptografi och skvaller.`
+        );
+        UI.renderFeed();
+        UI.toast('🎉 Välkommen till Skrivpunkten!', 'success');
+      }
     } catch (err) {
       UI.toast('Fel: ' + err.message, 'error');
       btn.disabled = false;
@@ -1949,6 +1974,29 @@ async function init() {
     UI.toast('✓ 3 fragment skapade — dela med betrodda vänner', 'success');
   });
 
+  function doLogout() {
+    sessionStorage.setItem('loggedOut', '1');
+    Identity.current = null;
+    Identity.privateKey = null;
+    document.getElementById('bottom-nav').style.display = 'none';
+    document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+    const onboard = document.getElementById('screen-onboard');
+    onboard.classList.add('active');
+    // Pre-fill name so user just clicks "Logga in"
+    DB.get('identity', 'self').then(id => {
+      if (id) {
+        document.getElementById('onboard-name').value = id.name;
+        document.getElementById('onboard-bio').value = id.bio || '';
+        document.getElementById('btn-create-identity').textContent = '🔑 Logga in';
+      }
+    });
+  }
+
+  document.getElementById('btn-nav-logout')?.addEventListener('click', () => {
+    if (!confirm('Logga ut? Din identitet och dina inlägg finns kvar.')) return;
+    doLogout();
+  });
+
   document.getElementById('btn-reset-identity')?.addEventListener('click', async () => {
     if (!confirm('⚠ Detta raderar din identitet och ALL data. Kan inte ångras. Fortsätta?')) return;
     await DB.clear('identity');
@@ -1956,6 +2004,7 @@ async function init() {
     await DB.clear('peers');
     await DB.clear('seen');
     localStorage.clear();
+    sessionStorage.removeItem('loggedOut');
     location.reload();
   });
 
