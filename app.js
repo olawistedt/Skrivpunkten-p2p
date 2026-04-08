@@ -116,7 +116,7 @@ const Crypto = {
 const DB = {
   db: null,
   DB_NAME: 'mycel-v1',
-  VERSION: 2,
+  VERSION: 3,
 
   async open() {
     return new Promise((resolve, reject) => {
@@ -140,6 +140,14 @@ const DB = {
         if (!db.objectStoreNames.contains('likes')) {
           const ls = db.createObjectStore('likes', { keyPath: 'id' });
           ls.createIndex('by_post', 'postId');
+        }
+        if (!db.objectStoreNames.contains('comments')) {
+          const cs = db.createObjectStore('comments', { keyPath: 'id' });
+          cs.createIndex('by_post', 'postId');
+        }
+        if (!db.objectStoreNames.contains('comment_likes')) {
+          const cl = db.createObjectStore('comment_likes', { keyPath: 'id' });
+          cl.createIndex('by_comment', 'commentId');
         }
       };
       req.onsuccess = e => { DB.db = e.target.result; resolve(DB.db); };
@@ -349,6 +357,66 @@ const Likes = {
   /** Hämta alla gillningar (för synkronisering). */
   async getAll() {
     return DB.getAll('likes');
+  }
+};
+
+// ══════════════════════════════════════════════════════════
+// 4c. KOMMENTARER (Comments)
+// ══════════════════════════════════════════════════════════
+const Comments = {
+  async create(postId, text) {
+    if (!Identity.current) throw new Error('Inte inloggad');
+    const id = Crypto.uuid();
+    const timestamp = Date.now();
+    const payload = JSON.stringify({ id, postId, text, authorPubkey: Identity.current.pubkey, timestamp });
+    const signature = await Identity.sign(payload);
+    const comment = {
+      id, postId, text,
+      authorPubkey: Identity.current.pubkey,
+      authorName: Identity.current.name,
+      timestamp, signature, hops: 0
+    };
+    await DB.put('comments', comment);
+    await DB.put('seen', { id: `c:${id}` });
+    return comment;
+  },
+
+  async getAll() {
+    return DB.getAll('comments');
+  },
+
+  async receiveFromGossip(comment) {
+    const seenKey = `c:${comment.id}`;
+    if (await DB.get('seen', seenKey)) return false;
+    const payload = JSON.stringify({
+      id: comment.id, postId: comment.postId, text: comment.text,
+      authorPubkey: comment.authorPubkey, timestamp: comment.timestamp
+    });
+    const valid = await Crypto.verify(comment.authorPubkey, payload, comment.signature);
+    if (!valid) { console.warn('Ogiltig signatur på kommentar:', comment.id); return false; }
+    comment.hops = (comment.hops || 0) + 1;
+    await DB.put('comments', comment);
+    await DB.put('seen', { id: seenKey });
+    return true;
+  }
+};
+
+// ══════════════════════════════════════════════════════════
+// 4d. KOMMENTARGILLNINGAR (CommentLikes)
+// ══════════════════════════════════════════════════════════
+const CommentLikes = {
+  async add(like) {
+    const id = `${like.commentId}:${like.likerPubkey}`;
+    await DB.put('comment_likes', { ...like, id });
+    return id;
+  },
+
+  async has(commentId, pubkey) {
+    return !!(await DB.get('comment_likes', `${commentId}:${pubkey}`));
+  },
+
+  async getAll() {
+    return DB.getAll('comment_likes');
   }
 };
 
@@ -795,13 +863,14 @@ const Gossip = {
       case 'sync_request': {
         const posts = await Posts.getAll();
         const likes = await Likes.getAll();
+        const comments = await Comments.getAll();
+        const commentLikes = await CommentLikes.getAll();
         const conn = Peers.connections.get(fromPubkey);
         if (conn?.channel?.readyState === 'open') {
           conn.channel.send(JSON.stringify({
             type: 'sync_response',
             from: Identity.current.pubkey,
-            posts,
-            likes
+            posts, likes, comments, commentLikes
           }));
         }
         break;
@@ -820,10 +889,20 @@ const Gossip = {
             if (like?.postId && like?.likerPubkey) await Likes.add(like);
           }
         }
+        if (msg.comments && Array.isArray(msg.comments)) {
+          for (const comment of msg.comments) {
+            await Comments.receiveFromGossip(comment);
+          }
+        }
+        if (msg.commentLikes && Array.isArray(msg.commentLikes)) {
+          for (const cl of msg.commentLikes) {
+            if (cl?.commentId && cl?.likerPubkey) await CommentLikes.add(cl);
+          }
+        }
         if (newCount > 0) {
           UI.renderFeed();
           UI.toast(`🔄 Synkroniserade ${newCount} nya inlägg`, 'info');
-        } else if (msg.likes?.length > 0) {
+        } else if (msg.likes?.length || msg.comments?.length || msg.commentLikes?.length) {
           UI.renderFeed();
         }
         break;
@@ -839,6 +918,24 @@ const Gossip = {
       case 'like':
         if (msg.like?.postId && msg.like?.likerPubkey) {
           await Likes.add(msg.like);
+          UI.renderFeed();
+          Gossip.forwardToOthers(msg, fromPubkey);
+        }
+        break;
+
+      case 'comment':
+        if (Gossip.active && msg.comment) {
+          const isNew = await Comments.receiveFromGossip(msg.comment);
+          if (isNew) {
+            UI.renderFeed();
+            Gossip.forwardToOthers(msg, fromPubkey);
+          }
+        }
+        break;
+
+      case 'comment_like':
+        if (msg.like?.commentId && msg.like?.likerPubkey) {
+          await CommentLikes.add(msg.like);
           UI.renderFeed();
           Gossip.forwardToOthers(msg, fromPubkey);
         }
@@ -873,6 +970,7 @@ const Gossip = {
 
   forwardToOthers(msg, exceptPubkey) {
     if (msg.post && msg.post.hops >= 6) return; // max 6 hopp
+    if (msg.comment && msg.comment.hops >= 6) return;
     for (const [pubkey, conn] of Peers.connections) {
       if (pubkey === exceptPubkey) continue;
       if (conn.channel?.readyState === 'open') {
@@ -1120,64 +1218,113 @@ const UI = {
 
   renderFeed() {
     const myPk = Identity.current?.pubkey;
-    Promise.all([Posts.getAll(), Likes.getAll()]).then(([posts, allLikes]) => {
-      const container = document.getElementById('feed-list');
-      const label = document.getElementById('feed-label');
-      if (!container) return;
+    // Kom ihåg vilka kommentarssektioner som är öppna innan vi bygger om DOM:en
+    const openComments = new Set(
+      [...document.querySelectorAll('.post-comments:not([hidden])')].map(el => el.dataset.postId)
+    );
+    Promise.all([Posts.getAll(), Likes.getAll(), Comments.getAll(), CommentLikes.getAll()])
+      .then(([posts, allLikes, allComments, allCommentLikes]) => {
+        const container = document.getElementById('feed-list');
+        const label = document.getElementById('feed-label');
+        if (!container) return;
 
-      // Gruppera gillningar per inlägg
-      const likesByPost = new Map();
-      for (const like of allLikes) {
-        if (!likesByPost.has(like.postId)) likesByPost.set(like.postId, []);
-        likesByPost.get(like.postId).push(like);
-      }
+        // Indexera gillningar per inlägg
+        const likesByPost = new Map();
+        for (const like of allLikes) {
+          if (!likesByPost.has(like.postId)) likesByPost.set(like.postId, []);
+          likesByPost.get(like.postId).push(like);
+        }
+        // Indexera kommentarer per inlägg (äldst först)
+        const commentsByPost = new Map();
+        for (const c of allComments) {
+          if (!commentsByPost.has(c.postId)) commentsByPost.set(c.postId, []);
+          commentsByPost.get(c.postId).push(c);
+        }
+        for (const arr of commentsByPost.values()) arr.sort((a, b) => a.timestamp - b.timestamp);
+        // Indexera kommentargillningar per kommentar
+        const likesByComment = new Map();
+        for (const cl of allCommentLikes) {
+          if (!likesByComment.has(cl.commentId)) likesByComment.set(cl.commentId, []);
+          likesByComment.get(cl.commentId).push(cl);
+        }
 
-      label.textContent = `Flöde — ${posts.length} inlägg`;
+        label.textContent = `Flöde — ${posts.length} inlägg`;
 
-      if (posts.length === 0) {
-        container.innerHTML = `
-          <div class="card text-muted text-center" style="font-size:13px;padding:32px;">
-            Inga inlägg ännu.<br>
-            <span style="font-size:11px;margin-top:8px;display:block;">
-              Skriv ditt första inlägg ovan, eller anslut till en peer för att se deras flöde.
-            </span>
+        if (posts.length === 0) {
+          container.innerHTML = `
+            <div class="card text-muted text-center" style="font-size:13px;padding:32px;">
+              Inga inlägg ännu.<br>
+              <span style="font-size:11px;margin-top:8px;display:block;">
+                Skriv ditt första inlägg ovan, eller anslut till en peer för att se deras flöde.
+              </span>
+            </div>`;
+          return;
+        }
+
+        container.innerHTML = posts.map(p => {
+          // Inläggsgillningar
+          const likes = likesByPost.get(p.id) || [];
+          const iLiked = likes.some(l => l.likerPubkey === myPk);
+          const hasLikes = likes.length > 0;
+          const likeNames = likes.map(l => escHtml(l.likerName || l.likerPubkey.slice(0, 8))).join(', ');
+          const likeClass = iLiked ? ' liked' : (hasLikes ? ' has-likes' : '');
+          const likeLabel = hasLikes ? `♥ ${likes.length}` : '♡ gilla';
+
+          // Kommentarer
+          const comments = commentsByPost.get(p.id) || [];
+          const commentsHtml = comments.map(c => {
+            const cLikes = likesByComment.get(c.id) || [];
+            const cLiked = cLikes.some(l => l.likerPubkey === myPk);
+            const cHasLikes = cLikes.length > 0;
+            const cLikeClass = cLiked ? ' liked' : (cHasLikes ? ' has-likes' : '');
+            const cLikeLabel = cHasLikes ? `♥ ${cLikes.length}` : '♡';
+            const cLikeTitle = cLikes.map(l => escHtml(l.likerName || l.likerPubkey.slice(0, 8))).join(', ');
+            return `<div class="comment">
+              <div class="avatar" style="font-size:18px;line-height:1">${Identity.avatarEmoji(c.authorPubkey)}</div>
+              <div class="comment-body">
+                <div class="comment-meta"><strong>${escHtml(c.authorName || 'Okänd')}</strong>${timeAgo(c.timestamp)}</div>
+                <div class="comment-text">${escHtml(c.text)}</div>
+                <button class="post-action-btn${cLikeClass}" onclick="UI.likeComment('${c.id}')" title="${cLikeTitle}" style="font-size:10px;padding:1px 4px">${cLikeLabel}</button>
+              </div>
+            </div>`;
+          }).join('');
+
+          return `
+          <div class="post-card" data-id="${p.id}">
+            <div class="post-header">
+              <div class="avatar">${Identity.avatarEmoji(p.authorPubkey)}</div>
+              <div class="post-author">
+                <strong>${escHtml(p.authorName || 'Okänd')}</strong>
+                <span>${Identity.shortKey(p.authorPubkey)} · ${timeAgo(p.timestamp)}</span>
+              </div>
+              <div class="post-sig" title="Kryptografiskt signerat inlägg">🔏 verifierat</div>
+            </div>
+            <div class="post-content">${escHtml(p.text)}</div>
+            <div class="post-footer">
+              <button class="post-action-btn${likeClass}" onclick="UI.likePost('${p.id}')" title="${likeNames}">${likeLabel}</button>
+              <button class="post-action-btn" onclick="UI.toggleComments('${p.id}')">💬${comments.length > 0 ? ` ${comments.length}` : ''}</button>
+              <button class="post-action-btn" onclick="UI.gossipPost('${p.id}')">📡 gossip</button>
+              ${p.local ? `<button class="post-action-btn" onclick="UI.deletePost('${p.id}')">🗑 radera</button>` : ''}
+              <span class="hops">${p.hops > 0 ? `${p.hops} hopp` : 'lokalt'}</span>
+            </div>
+            <div class="post-comments" data-post-id="${p.id}" id="comments-${p.id}" hidden>
+              ${commentsHtml}
+              <div class="comment-form">
+                <input type="text" class="comment-input" id="comment-input-${p.id}"
+                  placeholder="Skriv en kommentar…" maxlength="500"
+                  onkeydown="if(event.key==='Enter')UI.addComment('${p.id}')">
+                <button class="comment-submit" onclick="UI.addComment('${p.id}')">→</button>
+              </div>
+            </div>
           </div>`;
-        return;
-      }
+        }).join('');
 
-      container.innerHTML = posts.map(p => {
-        const likes = likesByPost.get(p.id) || [];
-        const iLiked = likes.some(l => l.likerPubkey === myPk);
-        const hasLikes = likes.length > 0;
-        const likeNames = likes.map(l => escHtml(l.likerName || l.likerPubkey.slice(0, 8))).join(', ');
-        const likeClass = iLiked ? ' liked' : (hasLikes ? ' has-likes' : '');
-        const likeLabel = hasLikes ? `♥ ${likes.length}` : '♡ gilla';
-        return `
-        <div class="post-card" data-id="${p.id}">
-          <div class="post-header">
-            <div class="avatar">${Identity.avatarEmoji(p.authorPubkey)}</div>
-            <div class="post-author">
-              <strong>${escHtml(p.authorName || 'Okänd')}</strong>
-              <span>${Identity.shortKey(p.authorPubkey)} · ${timeAgo(p.timestamp)}</span>
-            </div>
-            <div class="post-sig" title="Kryptografiskt signerat inlägg">
-              🔏 verifierat
-            </div>
-          </div>
-          <div class="post-content">${escHtml(p.text)}</div>
-          <div class="post-footer">
-            <button class="post-action-btn${likeClass}" onclick="UI.likePost('${p.id}')" title="${likeNames}">
-              ${likeLabel}
-            </button>
-            <button class="post-action-btn" onclick="UI.gossipPost('${p.id}')">
-              📡 gossip
-            </button>
-            ${p.local ? `<button class="post-action-btn" onclick="UI.deletePost('${p.id}')">🗑 radera</button>` : ''}
-            <span class="hops">${p.hops > 0 ? `${p.hops} hopp` : 'lokalt'}</span>
-          </div>
-        </div>`;
-      }).join('');
-    });
+        // Återöppna kommentarssektioner som var öppna innan rendern
+        for (const postId of openComments) {
+          const el = document.getElementById(`comments-${postId}`);
+          if (el) el.hidden = false;
+        }
+      });
   },
 
   async likePost(id) {
@@ -1197,6 +1344,53 @@ const UI = {
     Gossip.broadcast({ type: 'like', like });
     UI.renderFeed();
     UI.toast('♥ Gillat!', 'success');
+  },
+
+  toggleComments(postId) {
+    const el = document.getElementById(`comments-${postId}`);
+    if (!el) return;
+    el.hidden = !el.hidden;
+    if (!el.hidden) {
+      const input = document.getElementById(`comment-input-${postId}`);
+      if (input) setTimeout(() => input.focus(), 0);
+    }
+  },
+
+  async addComment(postId) {
+    const input = document.getElementById(`comment-input-${postId}`);
+    const text = input?.value.trim();
+    if (!text) return;
+    input.value = '';
+    const comment = await Comments.create(postId, text);
+    Gossip.broadcast({ type: 'comment', comment });
+    UI.renderFeed();
+    // Återöppna kommentarssektionen efter renderingen
+    setTimeout(() => {
+      const el = document.getElementById(`comments-${postId}`);
+      if (el) el.hidden = false;
+    }, 0);
+  },
+
+  async likeComment(commentId) {
+    const myPk = Identity.current?.pubkey;
+    if (!myPk) return;
+    if (await CommentLikes.has(commentId, myPk)) {
+      UI.toast('Du har redan gillat denna kommentar', 'info');
+      return;
+    }
+    const like = { commentId, likerPubkey: myPk, likerName: Identity.current.name, timestamp: Date.now() };
+    await CommentLikes.add(like);
+    Gossip.broadcast({ type: 'comment_like', like });
+    // Hitta postId för att hålla kommentarssektionen öppen
+    const allComments = await Comments.getAll();
+    const comment = allComments.find(c => c.id === commentId);
+    UI.renderFeed();
+    if (comment) {
+      setTimeout(() => {
+        const el = document.getElementById(`comments-${comment.postId}`);
+        if (el) el.hidden = false;
+      }, 0);
+    }
   },
 
   async gossipPost(id) {
