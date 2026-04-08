@@ -115,7 +115,7 @@ const Crypto = {
 // ══════════════════════════════════════════════════════════
 const DB = {
   db: null,
-  DB_NAME: 'mycel-v1',
+  DB_NAME: 'mycel-v1', // overridden per-user at login
   VERSION: 3,
 
   async open() {
@@ -1745,50 +1745,63 @@ function timeAgo(ts) {
 // BOOTSTRAP — Huvudinitialisering
 // ══════════════════════════════════════════════════════════
 async function init() {
-  await DB.open();
   const loggedOut = sessionStorage.getItem('loggedOut');
-  const id = loggedOut ? null : await Identity.load();
+  let currentDb = sessionStorage.getItem('currentDb');
 
-  if (id) {
-    // Befintlig användare
-    UI.updateHeaderCompose();
-    UI.showMainApp();
-    Gossip.init();
-    Network.init();
-    SW.register();
-
-    // Läs in sparade kontakter från localStorage och synka till IndexedDB
-    try {
-      const lsContacts = JSON.parse(localStorage.getItem('mycel-contacts') || '[]');
-      for (const c of lsContacts) {
-        await Peers.add({ pubkey: c.pubkey, name: c.name, lastSeen: c.lastConnected });
-      }
-    } catch { }
-
-    // Automatisk återanslutning till kända peers
-    Peers.getAll().then(savedPeers => ManualSignaling.autoReconnect(savedPeers));
-
-    // MQTT-signaling för cross-browser-återanslutning (ingen server krävs)
-    MqttSignaling.connect();
-
-    // Rensa peer-param ur URL om den finns kvar från en gammal session
-    const url = new URL(location.href);
-    if (url.searchParams.has('peer')) {
-      history.replaceState({}, '', location.pathname);
+  // ── Migration: if no accounts registry yet, check the old single DB ──
+  const accounts = JSON.parse(localStorage.getItem('mycel-accounts') || '[]');
+  if (accounts.length === 0 && !loggedOut && !currentDb) {
+    DB.DB_NAME = 'mycel-v1';
+    await DB.open();
+    const oldId = await DB.get('identity', 'self');
+    if (oldId) {
+      accounts.push({ name: oldId.name, dbName: 'mycel-v1' });
+      localStorage.setItem('mycel-accounts', JSON.stringify(accounts));
+      currentDb = 'mycel-v1';
+      sessionStorage.setItem('currentDb', 'mycel-v1');
     }
+  }
 
-    // Periodisk status-uppdatering
-    setInterval(() => {
-      UI.updateConnectionStatus(navigator.onLine || Peers.onlineCount() > 0);
-    }, 3000);
-    UI.updateConnectionStatus(navigator.onLine);
-  } else {
-    // Ny användare eller utloggad — visa onboarding
-    const existingId = await DB.get('identity', 'self');
-    if (existingId) {
-      // Returning user: pre-fill name and update button label
-      document.getElementById('onboard-name').value = existingId.name;
-      document.getElementById('onboard-bio').value = existingId.bio || '';
+  let loggedIn = false;
+  if (!loggedOut && currentDb) {
+    DB.DB_NAME = currentDb;
+    if (!DB.db) await DB.open();
+    const id = await Identity.load();
+    if (id) {
+      loggedIn = true;
+      UI.updateHeaderCompose();
+      UI.showMainApp();
+      Gossip.init();
+      Network.init();
+      SW.register();
+
+      try {
+        const lsContacts = JSON.parse(localStorage.getItem('mycel-contacts') || '[]');
+        for (const c of lsContacts) {
+          await Peers.add({ pubkey: c.pubkey, name: c.name, lastSeen: c.lastConnected });
+        }
+      } catch { }
+
+      Peers.getAll().then(savedPeers => ManualSignaling.autoReconnect(savedPeers));
+      MqttSignaling.connect();
+
+      const url = new URL(location.href);
+      if (url.searchParams.has('peer')) {
+        history.replaceState({}, '', location.pathname);
+      }
+
+      setInterval(() => {
+        UI.updateConnectionStatus(navigator.onLine || Peers.onlineCount() > 0);
+      }, 3000);
+      UI.updateConnectionStatus(navigator.onLine);
+    }
+  }
+
+  if (!loggedIn) {
+    // Pre-fill if a single account exists (most common case for returning user)
+    const savedAccounts = JSON.parse(localStorage.getItem('mycel-accounts') || '[]');
+    if (savedAccounts.length === 1) {
+      document.getElementById('onboard-name').value = savedAccounts[0].name;
       document.getElementById('btn-create-identity').textContent = '🔑 Logga in';
     }
     document.getElementById('screen-onboard').classList.add('active');
@@ -1804,9 +1817,15 @@ async function init() {
     const btn = document.getElementById('btn-create-identity');
     btn.disabled = true;
     try {
-      const existing = await DB.get('identity', 'self');
-      if (existing && existing.name === name) {
-        // Resume existing identity — just load keys
+      const accounts = JSON.parse(localStorage.getItem('mycel-accounts') || '[]');
+      const existing = accounts.find(a => a.name === name);
+
+      if (existing) {
+        // Returning user — open their own DB
+        DB.DB_NAME = existing.dbName;
+        DB.db = null;
+        await DB.open();
+        sessionStorage.setItem('currentDb', existing.dbName);
         sessionStorage.removeItem('loggedOut');
         await Identity.load();
         UI.updateHeaderCompose();
@@ -1818,14 +1837,18 @@ async function init() {
         UI.renderFeed();
         UI.toast('✓ Välkommen tillbaka, ' + name + '!', 'success');
       } else {
-        // Different name = new person — clear all previous data first
-        await DB.clear('posts');
-        await DB.clear('peers');
-        await DB.clear('seen');
-        localStorage.clear();
-        // New identity
-        await Identity.create(name, bio);
+        // New user — create a fresh isolated DB
+        const slug = name.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12) || 'user';
+        const rand = Math.random().toString(36).slice(2, 6);
+        const dbName = `mycel-u-${slug}-${rand}`;
+        DB.DB_NAME = dbName;
+        DB.db = null;
+        await DB.open();
+        sessionStorage.setItem('currentDb', dbName);
         sessionStorage.removeItem('loggedOut');
+        accounts.push({ name, dbName });
+        localStorage.setItem('mycel-accounts', JSON.stringify(accounts));
+        await Identity.create(name, bio);
         UI.updateHeaderCompose();
         UI.showMainApp();
         Gossip.init();
@@ -1981,6 +2004,7 @@ async function init() {
 
   function doLogout() {
     sessionStorage.setItem('loggedOut', '1');
+    sessionStorage.removeItem('currentDb');
     location.reload();
   }
 
@@ -1990,12 +2014,19 @@ async function init() {
 
   document.getElementById('btn-reset-identity')?.addEventListener('click', async () => {
     if (!confirm('⚠ Detta raderar din identitet och ALL data. Kan inte ångras. Fortsätta?')) return;
+    // Remove this user from the accounts registry
+    const currentDb = sessionStorage.getItem('currentDb');
+    const accounts = JSON.parse(localStorage.getItem('mycel-accounts') || '[]');
+    localStorage.setItem('mycel-accounts', JSON.stringify(accounts.filter(a => a.dbName !== currentDb)));
     await DB.clear('identity');
     await DB.clear('posts');
     await DB.clear('peers');
     await DB.clear('seen');
-    localStorage.clear();
+    await DB.clear('likes');
+    await DB.clear('comments');
+    await DB.clear('comment_likes');
     sessionStorage.removeItem('loggedOut');
+    sessionStorage.removeItem('currentDb');
     location.reload();
   });
 
