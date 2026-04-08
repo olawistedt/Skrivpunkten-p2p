@@ -1818,6 +1818,11 @@ async function init() {
         UI.renderFeed();
         UI.toast('✓ Välkommen tillbaka, ' + name + '!', 'success');
       } else {
+        // Different name = new person — clear all previous data first
+        await DB.clear('posts');
+        await DB.clear('peers');
+        await DB.clear('seen');
+        localStorage.clear();
         // New identity
         await Identity.create(name, bio);
         sessionStorage.removeItem('loggedOut');
