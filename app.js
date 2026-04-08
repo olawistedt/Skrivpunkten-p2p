@@ -116,7 +116,7 @@ const Crypto = {
 const DB = {
   db: null,
   DB_NAME: 'mycel-v1',
-  VERSION: 1,
+  VERSION: 2,
 
   async open() {
     return new Promise((resolve, reject) => {
@@ -136,6 +136,10 @@ const DB = {
         }
         if (!db.objectStoreNames.contains('seen')) {
           db.createObjectStore('seen', { keyPath: 'id' }); // gossip dedup
+        }
+        if (!db.objectStoreNames.contains('likes')) {
+          const ls = db.createObjectStore('likes', { keyPath: 'id' });
+          ls.createIndex('by_post', 'postId');
         }
       };
       req.onsuccess = e => { DB.db = e.target.result; resolve(DB.db); };
@@ -318,6 +322,33 @@ const Posts = {
     await DB.put('posts', post);
     await DB.put('seen', { id: post.id });
     return true;
+  }
+};
+
+// ══════════════════════════════════════════════════════════
+// 4b. GILLNINGAR (Likes)
+// ══════════════════════════════════════════════════════════
+const Likes = {
+  /** Spara en gillning lokalt. id = postId:likerPubkey (idempotent). */
+  async add(like) {
+    const id = `${like.postId}:${like.likerPubkey}`;
+    await DB.put('likes', { ...like, id });
+    return id;
+  },
+
+  /** Hämta alla gillningar för ett inlägg. */
+  async getForPost(postId) {
+    return DB.getAll('likes', 'by_post', postId);
+  },
+
+  /** Returnera true om pubkey redan gillat postId. */
+  async has(postId, pubkey) {
+    return !!(await DB.get('likes', `${postId}:${pubkey}`));
+  },
+
+  /** Hämta alla gillningar (för synkronisering). */
+  async getAll() {
+    return DB.getAll('likes');
   }
 };
 
@@ -763,35 +794,53 @@ const Gossip = {
 
       case 'sync_request': {
         const posts = await Posts.getAll();
+        const likes = await Likes.getAll();
         const conn = Peers.connections.get(fromPubkey);
         if (conn?.channel?.readyState === 'open') {
           conn.channel.send(JSON.stringify({
             type: 'sync_response',
             from: Identity.current.pubkey,
-            posts
+            posts,
+            likes
           }));
         }
         break;
       }
 
-      case 'sync_response':
+      case 'sync_response': {
+        let newCount = 0;
         if (msg.posts && Array.isArray(msg.posts)) {
-          let newCount = 0;
           for (const post of msg.posts) {
             const isNew = await Posts.receiveFromGossip(post);
             if (isNew) newCount++;
           }
-          if (newCount > 0) {
-            UI.renderFeed();
-            UI.toast(`🔄 Synkroniserade ${newCount} nya inlägg`, 'info');
+        }
+        if (msg.likes && Array.isArray(msg.likes)) {
+          for (const like of msg.likes) {
+            if (like?.postId && like?.likerPubkey) await Likes.add(like);
           }
         }
+        if (newCount > 0) {
+          UI.renderFeed();
+          UI.toast(`🔄 Synkroniserade ${newCount} nya inlägg`, 'info');
+        } else if (msg.likes?.length > 0) {
+          UI.renderFeed();
+        }
         break;
+      }
 
       case 'delete':
         if (msg.id) {
           await DB.delete('posts', msg.id);
           UI.renderFeed();
+        }
+        break;
+
+      case 'like':
+        if (msg.like?.postId && msg.like?.likerPubkey) {
+          await Likes.add(msg.like);
+          UI.renderFeed();
+          Gossip.forwardToOthers(msg, fromPubkey);
         }
         break;
     }
@@ -1070,10 +1119,18 @@ const UI = {
   },
 
   renderFeed() {
-    Posts.getAll().then(posts => {
+    const myPk = Identity.current?.pubkey;
+    Promise.all([Posts.getAll(), Likes.getAll()]).then(([posts, allLikes]) => {
       const container = document.getElementById('feed-list');
       const label = document.getElementById('feed-label');
       if (!container) return;
+
+      // Gruppera gillningar per inlägg
+      const likesByPost = new Map();
+      for (const like of allLikes) {
+        if (!likesByPost.has(like.postId)) likesByPost.set(like.postId, []);
+        likesByPost.get(like.postId).push(like);
+      }
 
       label.textContent = `Flöde — ${posts.length} inlägg`;
 
@@ -1088,7 +1145,14 @@ const UI = {
         return;
       }
 
-      container.innerHTML = posts.map(p => `
+      container.innerHTML = posts.map(p => {
+        const likes = likesByPost.get(p.id) || [];
+        const iLiked = likes.some(l => l.likerPubkey === myPk);
+        const likeNames = likes.map(l => escHtml(l.likerName || l.likerPubkey.slice(0, 8))).join(', ');
+        const likeLabel = likes.length > 0
+          ? `${iLiked ? '♥' : '♡'} ${likes.length}`
+          : (iLiked ? '♥' : '♡ gilla');
+        return `
         <div class="post-card" data-id="${p.id}">
           <div class="post-header">
             <div class="avatar">${Identity.avatarEmoji(p.authorPubkey)}</div>
@@ -1102,8 +1166,8 @@ const UI = {
           </div>
           <div class="post-content">${escHtml(p.text)}</div>
           <div class="post-footer">
-            <button class="post-action-btn" onclick="UI.likePost('${p.id}')">
-              ♡ gilla
+            <button class="post-action-btn${iLiked ? ' liked' : ''}" onclick="UI.likePost('${p.id}')" title="${likeNames}">
+              ${likeLabel}
             </button>
             <button class="post-action-btn" onclick="UI.gossipPost('${p.id}')">
               📡 gossip
@@ -1111,14 +1175,28 @@ const UI = {
             ${p.local ? `<button class="post-action-btn" onclick="UI.deletePost('${p.id}')">🗑 radera</button>` : ''}
             <span class="hops">${p.hops > 0 ? `${p.hops} hopp` : 'lokalt'}</span>
           </div>
-        </div>
-      `).join('');
+        </div>`;
+      }).join('');
     });
   },
 
   async likePost(id) {
-    UI.toast('♥ Gilla-signal skickas via gossip…', 'info');
-    Gossip.broadcast({ type: 'like', postId: id });
+    const myPk = Identity.current?.pubkey;
+    if (!myPk) return;
+    if (await Likes.has(id, myPk)) {
+      UI.toast('Du har redan gillat detta inlägg', 'info');
+      return;
+    }
+    const like = {
+      postId: id,
+      likerPubkey: myPk,
+      likerName: Identity.current.name,
+      timestamp: Date.now()
+    };
+    await Likes.add(like);
+    Gossip.broadcast({ type: 'like', like });
+    UI.renderFeed();
+    UI.toast('♥ Gillat!', 'success');
   },
 
   async gossipPost(id) {
